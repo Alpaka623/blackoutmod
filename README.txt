@@ -1,4 +1,4 @@
-# BlackoutMod v3.0.0 for LOCKDOWN Protocol
+# BlackoutMod v3.0 for LOCKDOWN Protocol
 
 The Dissident can sabotage a defibrillator and cut the power: the lights flicker,
 a power-down sound plays and the whole facility goes dark for every player in
@@ -26,7 +26,7 @@ your group.
      press Enter for a random code, then choose the settings. Share the code with your friends.
    - **Join a lobby** (everyone else): enter the code from your host.
      The installer shows the host's settings.
-5. Start the game. The UE4SS console should show `BlackoutMod v3.0.0 LOADED`.
+5. Start the game. The UE4SS console should show `BlackoutMod v3.0 LOADED`.
 
 UE4SS (the mod loader) is included and installed automatically.
 
@@ -73,8 +73,9 @@ MaxBlackoutDuration=0
 | `MaxSabotagesPerRound` | Sabotages per Dissident per round, `0` = unlimited |
 | `Cooldown` | Seconds after the lights come back before the next sabotage, `0` = off |
 | `MaxBlackoutDuration` | Seconds until the lights come back by themselves, `0` = off |
+| `Helper` | Optional. `false` turns off the background helper (see *Antivirus warning*). Restart the game after changing it. |
 
-**Shared settings:** the last three settings come from the **host**. When the game
+**Shared settings:** `MaxSabotagesPerRound`, `Cooldown` and `MaxBlackoutDuration` come from the **host**. When the game
 starts (or on F5), the host's mod uploads them and everyone else's mod downloads
 them. In a player's config they are only used if the lobby has no host settings
 (older lobbies).
@@ -98,8 +99,18 @@ whether to remove UE4SS as well. Only remove UE4SS if no other mods use it.
 - The `OwnerKey` in your config belongs to a different lobby. Create a new lobby with the installer.
 
 **No sound**
-- The sound is played through Windows (PowerShell), so the in-game volume doesn't
-  affect it. Check the Windows volume mixer.
+- The sound is played by the mod's helper program (`BlackoutHelper.exe`) through
+  Windows, so the in-game volume doesn't affect it. Check the Windows volume mixer.
+- With `Helper=false` there is no sound.
+
+**Antivirus warning**
+- BlackoutMod starts a small helper program, `BlackoutHelper.exe` (in the mod's
+  `Scripts` folder). It keeps one connection to the lobby server open and plays the sound.
+  Its source code is in the mod's GitHub repository (`tools/helper`).
+- Some antivirus programs warn about unknown programs started by a game. If yours does,
+  allow `BlackoutHelper.exe`. **Never** move Windows files like `cmd.exe` to quarantine.
+- Or add `Helper=false` to `config.txt`: the mod then works without the helper
+  (sync through curl, no sound).
 
 **Game freezes**
 - Clicking into the UE4SS console window starts a text selection, which pauses all
@@ -107,7 +118,7 @@ whether to remove UE4SS as well. Only remove UE4SS if no other mods use it.
   console while the game runs. If it still happens, click the console and press **Esc**.
 
 **Mod doesn't load**
-- The UE4SS console opens with the game and should show `BlackoutMod v3.0.0 LOADED`.
+- The UE4SS console opens with the game and should show `BlackoutMod v3.0 LOADED`.
 - Run `install.bat` again. If you get "Access denied", run it as administrator.
 
 **Sabotage doesn't work**

@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.0.0
+## v3.0
 
 ### New
 - **Lobby settings by the host:** the installer can create a lobby (you choose
@@ -24,9 +24,10 @@
 - Clicking into the UE4SS console could freeze the game (QuickEdit is now turned off for that console window).
 
 ### Changed
-- Server sync runs in one background helper that keeps its connection open,
-  instead of starting curl every second. This cuts the data used per request
-  (no new TLS handshake every second). If the helper can't run, the mod uses curl as before.
+- Server sync runs in a small helper program (`BlackoutHelper.exe`) that keeps its
+  connection open, instead of starting curl every second. This cuts the data used per
+  request (no new TLS handshake every second). The helper also plays the sound and quits
+  with the game. If it can't run, or with `Helper=false`, the mod uses curl as before.
 - **P (manual repair) is disabled.** It let any player end a blackout.
 - Short lobby codes (4-5 characters) still work but show a warning. New lobbies need 6-8 characters.
 - Server: the list of lobby codes can no longer be read, and only valid blackout and settings data can be written.

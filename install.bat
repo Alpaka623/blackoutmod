@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
-title BlackoutMod v3.0.0 - Installer
+title BlackoutMod v3.0 - Installer
 color 0A
 cd /d "%~dp0"
 
 set "SERVER=https://blackoutmod-shared-default-rtdb.firebaseio.com/lobbies"
 
 echo ==========================================
-echo    BlackoutMod v3.0.0 - Installer
+echo    BlackoutMod v3.0 - Installer
 echo ==========================================
 echo.
 echo   1 = Install / Update

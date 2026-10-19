@@ -1,5 +1,5 @@
 local ModName = "BlackoutMod"
-local ModVersion = "3.0.0"
+local ModVersion = "3.0"
 local ServerUrl = "https://blackoutmod-shared-default-rtdb.firebaseio.com/lobbies"
 
 -- ============================================
@@ -20,14 +20,29 @@ local OwnerKey = ""  -- Only the lobby host has one; allows changing the shared 
 local MaxSabotagesPerRound = 1  -- 0 = unlimited, any other number = max sabotages per round per dissident
 local SabotageCooldown = 0  -- Seconds after the lights come back before the next sabotage (0 = off)
 local MaxBlackoutDuration = 0  -- Seconds until lights come back automatically (0 = off)
+local HelperEnabled = true  -- Helper=false in config.txt: no helper process (curl only, no sound)
 
 local UEHelpers = require("UEHelpers")
 
 local InteractionDistance = 300.0
 local PollInterval = 1000  -- 1 second polling
 
--- Runs a callback off the game thread (for blocking curl calls)
+-- Runs a callback off the game thread. Only for blocking curl calls: everything else
+-- runs on the game thread, Lua code on two threads at once is a likely cause of the
+-- "PANIC ... Ref was not function" crash in an early v3 test build.
 local RunAsync = ExecuteAsync or function(callback) ExecuteWithDelay(0, callback) end
+
+-- Runs callback every delayMs on the game thread
+function LoopOnGameThread(delayMs, callback)
+    local success = pcall(LoopInGameThreadWithDelay, delayMs, callback)
+    if not success then
+        -- Older UE4SS without game-thread loops
+        LoopAsync(delayMs, function()
+            ExecuteInGameThread(callback)
+            return false
+        end)
+    end
+end
 
 -- Performance optimizations
 -- Role caching (reduces FindAllOf calls)
@@ -94,6 +109,7 @@ function LoadConfig()
     MaxSabotagesPerRound = 1
     SabotageCooldown = 0
     MaxBlackoutDuration = 0
+    HelperEnabled = true
 
     local success, file = pcall(function()
         return io.open(configPath, "r")
@@ -132,6 +148,9 @@ function LoadConfig()
                     MaxSabotagesPerRound = ParseCount(value, 99) or MaxSabotagesPerRound
                 elseif key == "cooldown" then
                     SabotageCooldown = ParseCount(value, 3600) or SabotageCooldown
+                elseif key == "helper" then
+                    local enabled = ParseBool(value)
+                    if enabled ~= nil then HelperEnabled = enabled end
                 elseif key == "maxblackoutduration" then
                     MaxBlackoutDuration = ParseCount(value, 3600) or MaxBlackoutDuration
                 end
@@ -343,14 +362,30 @@ function DescribeLobbySettings()
 end
 
 function SyncLobbySettings()
-    RunAsync(function()
-        local success, err = pcall(function()
-            local url = ServerUrl .. "/" .. LobbyCode .. "/settings"
+    local code, key = LobbyCode, OwnerKey
+    local url = ServerUrl .. "/" .. code .. "/settings"
+    local values = string.format('{"maxSabotages":%d,"cooldown":%d,"maxDuration":%d}',
+        MaxSabotagesPerRound, SabotageCooldown, MaxBlackoutDuration)
 
-            if OwnerKey ~= "" then
-                local values = string.format('{"maxSabotages":%d,"cooldown":%d,"maxDuration":%d}',
-                    MaxSabotagesPerRound, SabotageCooldown, MaxBlackoutDuration)
-                local _, status = CurlRequest("PUT", url .. ".json", '{"key":"' .. OwnerKey .. '","values":' .. values .. '}')
+    -- Only the curl call runs in the background; results are applied on the game thread
+    RunAsync(function()
+        local body, status
+        local success, err = pcall(function()
+            if key ~= "" then
+                body, status = CurlRequest("PUT", url .. ".json", '{"key":"' .. key .. '","values":' .. values .. '}')
+            else
+                body = CurlRequest("GET", url .. "/values.json")
+            end
+        end)
+
+        ExecuteInGameThread(function()
+            if not success then
+                print("BlackoutMod: ERROR syncing lobby settings: " .. tostring(err))
+                return
+            end
+            if code ~= LobbyCode then return end  -- lobby changed (F5) in the meantime
+
+            if key ~= "" then
                 if status == 200 then
                     print("BlackoutMod: You are the lobby host, settings shared with all players:")
                 else
@@ -361,7 +396,6 @@ function SyncLobbySettings()
                 return
             end
 
-            local body = CurlRequest("GET", url .. "/values.json")
             local maxSabotages = ParseJsonNumber(body, "maxSabotages")
             local cooldown = ParseJsonNumber(body, "cooldown")
             local maxDuration = ParseJsonNumber(body, "maxDuration")
@@ -376,9 +410,6 @@ function SyncLobbySettings()
             end
             print("BlackoutMod:   " .. DescribeLobbySettings())
         end)
-        if not success then
-            print("BlackoutMod: ERROR syncing lobby settings: " .. tostring(err))
-        end
     end)
 end
 
@@ -406,16 +437,31 @@ function GetPlayerController()
     return nil
 end
 
-function GetPlayerLocation()
-    local pc = GetPlayerController()
-    if pc and pc:IsValid() then
-        local pawn = nil
-        pcall(function() pawn = pc:K2_GetPawn() end)
-        if pawn and pawn:IsValid() then 
-            return pawn:K2_GetActorLocation() 
+-- Returns a plain {X, Y, Z} table or nil. The values are copied and checked right away:
+-- during a map change the game's FVector can already be invalid and gave non-numbers
+-- ("bad argument #1 to 'sqrt'" in an early v3 test build).
+function ToPlainLocation(vector)
+    local location = nil
+    pcall(function()
+        local x, y, z = vector.X, vector.Y, vector.Z
+        if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+            location = {X = x, Y = y, Z = z}
         end
-    end
-    return nil
+    end)
+    return location
+end
+
+function GetPlayerLocation()
+    local location = nil
+    pcall(function()
+        local pc = GetPlayerController()
+        if not pc or not pc:IsValid() then return end
+        local pawn = pc:K2_GetPawn()
+        if pawn and pawn:IsValid() then
+            location = ToPlainLocation(pawn:K2_GetActorLocation())
+        end
+    end)
+    return location
 end
 
 -- ============================================
@@ -477,18 +523,20 @@ function HidePromptWidget()
 end
 
 -- ============================================
--- HELPER PROCESS (Scripts/blackout_helper.ps1)
+-- HELPER PROCESS (Scripts/BlackoutHelper.exe, source in tools/helper)
 -- ============================================
--- One PowerShell process runs for the whole game session and
+-- One helper process runs for the whole game session and
 -- - polls the blackout state over a kept-alive HTTPS connection and writes it to
 --   HelperStateFile. Starting curl every second cost a TLS handshake per request
 --   (~5 KB), most of the Firebase download quota.
 -- - sends sabotage/repair writes over the same connection
 -- - plays the WAV (game sound assets stay silent when played through UE4SS)
 -- - turns off QuickEdit for the shared UE4SS console (a click froze the game)
--- Commands go to its stdin, it exits when the game closes (stdin closes).
--- If it doesn't work (e.g. blocked by antivirus), polling and writes fall back to curl.
-local HelperScript = "ue4ss/Mods/BlackoutMod/Scripts/blackout_helper.ps1"
+-- Commands go to its stdin. It exits when stdin closes or the game process is gone.
+-- It used to be a PowerShell script, but Avast flagged the game starting PowerShell
+-- with the execution policy turned off. If it doesn't work (e.g. blocked by antivirus) or
+-- Helper=false is set, polling and writes fall back to curl (and there is no sound).
+local HelperExe = "ue4ss/Mods/BlackoutMod/Scripts/BlackoutHelper.exe"
 local HelperStateFile = "ue4ss/Mods/BlackoutMod/state.txt"
 local HelperStateMaxAge = 5  -- seconds; an older state means the helper isn't working
 local HelperPipe = nil
@@ -499,7 +547,12 @@ function ToWindowsPath(path)
 end
 
 function StartHelper()
-    for _, required in ipairs({HelperScript, FlickerSoundFile}) do
+    if not HelperEnabled then
+        print("BlackoutMod: Helper disabled (Helper=false): using curl, no sound")
+        return
+    end
+
+    for _, required in ipairs({HelperExe, FlickerSoundFile}) do
         local file = io.open(required, "rb")
         if not file then
             print("BlackoutMod: File not found: " .. required)
@@ -508,9 +561,10 @@ function StartHelper()
         file:close()
     end
 
-    -- No -WindowStyle Hidden: the helper shares the UE4SS console and would hide it
-    local cmd = string.format('powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%s" "%s" "%s" "%s"',
-        ToWindowsPath(HelperScript), ToWindowsPath(FlickerSoundFile), ServerUrl, ToWindowsPath(HelperStateFile))
+    -- The exe path has no spaces and must not start with a quote: cmd /c would strip
+    -- the first and last quote of the line
+    local cmd = string.format('%s "%s" "%s" "%s"',
+        ToWindowsPath(HelperExe), ToWindowsPath(FlickerSoundFile), ServerUrl, ToWindowsPath(HelperStateFile))
     local success, pipe = pcall(io.popen, cmd, "w")
     if success then HelperPipe = pipe end
 end
@@ -559,7 +613,7 @@ function PlayBlackoutSound()
     HelperSend("play")
 end
 
--- Started at load time so the first blackout has no PowerShell startup delay
+-- Started at load time so the first blackout has no startup delay
 StartHelper()
 HelperSend("lobby " .. LobbyCode)
 
@@ -588,12 +642,12 @@ function ScanChargerLocations()
         for _, charger in ipairs(chargers) do
             local ok, loc = pcall(function()
                 if charger and charger:IsValid() then
-                    return charger:K2_GetActorLocation()
+                    return ToPlainLocation(charger:K2_GetActorLocation())
                 end
                 return nil
             end)
             if ok and loc then
-                table.insert(CachedChargerLocations, {X = loc.X, Y = loc.Y, Z = loc.Z})
+                table.insert(CachedChargerLocations, loc)
             end
         end
     end)
@@ -1004,10 +1058,9 @@ end
 -- ============================================
 
 NotifyOnNewObject("/Script/Engine.PlayerController", function(ConstructedObject)
-    ExecuteInGameThread(function()
-        ExecuteWithDelay(3000, function()
-            FindModActor()
-        end)
+    -- ExecuteWithDelay ran FindModActor on the async thread
+    ExecuteInGameThreadWithDelay(3000, function()
+        FindModActor()
     end)
 end)
 
@@ -1051,66 +1104,69 @@ function ApplyServerState(serverBlackout, serverTimestamp)
     end
 end
 
--- Server Sync Loop (1 second)
--- Reads the helper's state file; only when the helper isn't working, curl asks the
--- server directly (on this async thread). Everything touching UObjects runs on the game thread.
-LoopAsync(PollInterval, function()
-    local serverBlackout, serverTimestamp
+-- Server Sync Loop (1 second, game thread)
+-- Reads the helper's state file. Only when the helper isn't working, curl asks the
+-- server directly in the background and the result is applied back on the game thread.
+local FallbackPollRunning = false
+
+function ApplySync(serverBlackout, serverTimestamp)
+    local syncSuccess, syncErr = pcall(function()
+        ApplyServerState(serverBlackout, serverTimestamp)
+        CheckWinConditions()
+        CheckLobbyReset()
+    end)
+    if not syncSuccess then
+        print("BlackoutMod: ERROR in sync loop: " .. tostring(syncErr))
+    end
+end
+
+LoopOnGameThread(PollInterval, function()
     local state = ReadHelperState()
     if state then
-        serverBlackout, serverTimestamp = state.isBlackout, state.timestamp
-    else
-        local response = SendHttpRequest("status", true)
-        serverBlackout = ParseJsonBool(response, "isBlackout")
-        serverTimestamp = ParseJsonNumber(response, "timestamp")
+        ApplySync(state.isBlackout, state.timestamp)
+        return
     end
 
-    ExecuteInGameThread(function()
-        local syncSuccess, syncErr = pcall(function()
-            ApplyServerState(serverBlackout, serverTimestamp)
-            CheckWinConditions()
-            CheckLobbyReset()
+    if FallbackPollRunning then return end
+    FallbackPollRunning = true
+    RunAsync(function()
+        local response = nil
+        pcall(function() response = SendHttpRequest("status", true) end)
+        ExecuteInGameThread(function()
+            FallbackPollRunning = false
+            ApplySync(ParseJsonBool(response, "isBlackout"), ParseJsonNumber(response, "timestamp"))
         end)
-        if not syncSuccess then
-            print("BlackoutMod: ERROR in sync loop: " .. tostring(syncErr))
-        end
     end)
-
-    return false
 end)
 
--- HUD Update Loop (200ms instead of 50ms for better performance)
-LoopAsync(200, function()
-    -- Charger scan (every 2s, ChargerScanInterval) happens inside CheckChargerProximity on the game thread
-    ExecuteInGameThread(function()
-        local hudSuccess, hudErr = pcall(function()
-            local nearCharger = CheckChargerProximity()
+-- HUD Update Loop (200ms, game thread)
+-- Charger scan (every 2s, ChargerScanInterval) happens inside CheckChargerProximity
+LoopOnGameThread(200, function()
+    local hudSuccess, hudErr = pcall(function()
+        local nearCharger = CheckChargerProximity()
 
-            -- Only check role if near charger
-            -- (Changing the prompt text from Lua is not possible: UE4SS can't construct
-            -- an FText in this game and the game crashes, so it is hidden during cooldown)
-            local shouldShow = false
-            if nearCharger then
-                local isDissident = IsPlayerDissident()  -- Now cached!
+        -- Only check role if near charger
+        -- (Changing the prompt text from Lua is not possible: UE4SS can't construct
+        -- an FText in this game and the game crashes, so it is hidden during cooldown)
+        local shouldShow = false
+        if nearCharger then
+            local isDissident = IsPlayerDissident()  -- Now cached!
 
-                shouldShow = isDissident and (not CurrentServerState) and (GetCooldownRemaining() <= 0)
-                if MaxSabotagesPerRound > 0 then
-                    shouldShow = shouldShow and (SabotageCount < MaxSabotagesPerRound)
-                end
+            shouldShow = isDissident and (not CurrentServerState) and (GetCooldownRemaining() <= 0)
+            if MaxSabotagesPerRound > 0 then
+                shouldShow = shouldShow and (SabotageCount < MaxSabotagesPerRound)
             end
+        end
 
-            if shouldShow then
-                ShowPromptWidget()
-            else
-                HidePromptWidget()
-            end
-        end)
-        if not hudSuccess then
-            print("BlackoutMod: ERROR in HUD loop: " .. tostring(hudErr))
+        if shouldShow then
+            ShowPromptWidget()
+        else
+            HidePromptWidget()
         end
     end)
-
-    return false
+    if not hudSuccess then
+        print("BlackoutMod: ERROR in HUD loop: " .. tostring(hudErr))
+    end
 end)
 
 -- ============================================
@@ -1223,28 +1279,32 @@ RegisterKeyBind(Key.I, function()
             end
         end
 
-        print("Helper: " .. (ReadHelperState() and "running (kept-alive connection)" or "not running, using curl"))
+        print("Helper: " .. (ReadHelperState() and "running (kept-alive connection)"
+            or (HelperEnabled and "not running, using curl" or "disabled (Helper=false), using curl")))
         print("")
         print("Checking server right now...")
 
-        -- Server check runs async so the game doesn't freeze while curl waits
+        -- Only curl runs in the background so the game doesn't freeze while it waits
         RunAsync(function()
-            local response = SendHttpRequest("status", true)
-            local serverBlackout = ParseJsonBool(response, "isBlackout")
+            local response = nil
+            pcall(function() response = SendHttpRequest("status", true) end)
+            ExecuteInGameThread(function()
+                local serverBlackout = ParseJsonBool(response, "isBlackout")
 
-            print("Server Response: " .. tostring(response))
-            print("Server isBlackout: " .. tostring(serverBlackout))
+                print("Server Response: " .. tostring(response))
+                print("Server isBlackout: " .. tostring(serverBlackout))
 
-            if serverBlackout ~= CurrentServerState then
-                print("")
-                print("WARNING: Out of sync!")
-                print("Local state: " .. tostring(CurrentServerState))
-                print("Server state: " .. tostring(serverBlackout))
-            else
-                print("")
-                print("Status: IN SYNC")
-            end
-            print("==========================================")
+                if serverBlackout ~= CurrentServerState then
+                    print("")
+                    print("WARNING: Out of sync!")
+                    print("Local state: " .. tostring(CurrentServerState))
+                    print("Server state: " .. tostring(serverBlackout))
+                else
+                    print("")
+                    print("Status: IN SYNC")
+                end
+                print("==========================================")
+            end)
         end)
     end)
 end)
