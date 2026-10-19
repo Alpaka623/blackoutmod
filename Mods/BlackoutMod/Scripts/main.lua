@@ -11,8 +11,7 @@ local MaxBlackoutDuration = 0  -- Seconds until lights come back automatically (
 local AllowManualRepair = false  -- P key repair (always allowed while DebugForceDissident is on)
 local SabotageCooldown = 0  -- Seconds after the lights come back before the next sabotage (0 = off)
 local FlickerBeforeBlackout = true  -- Lights flicker briefly before going out
-local FlickerSoundPath = "/Game/World/Bullet_Travel/MS_BulletImpact_Spark.MS_BulletImpact_Spark"  -- Played on each flicker, "" = no sound
-local FlickerSoundVolume = 1.0
+local FlickerSoundFile = "ue4ss/Mods/BlackoutMod/Sounds/flicker.wav"  -- Played when the blackout starts, "" = no sound
 -- ============================================
 -- CONFIGURATION END
 -- ============================================
@@ -359,60 +358,65 @@ end
 -- SOUND
 -- ============================================
 
-local SoundErrorsLogged = {}
+-- Game sound assets can be played (IsPlaying = true) but stay silent in this game,
+-- so the mod plays its own WAV through Windows (not affected by the in-game volume).
+-- A PowerShell player is started once and preloads the file; each line written to
+-- its stdin plays it. Starting PowerShell per sound took too long (sound came after
+-- the flicker). The player exits by itself when the game closes (stdin closes).
+local SoundPlayers = {}  -- path -> pipe to the player's stdin
+local SoundErrorLogged = false
 
-function FindSound(path)
-    local sound = StaticFindObject(path)
-    if not sound or not sound:IsValid() then
-        sound = LoadAsset(path)
+function StartSoundPlayer(path)
+    local file = io.open(path, "rb")
+    if not file then
+        print("BlackoutMod: Sound file not found: " .. path)
+        return nil
     end
-    if not sound or not sound:IsValid() then
-        error("sound not found")
-    end
-    return sound
+    file:close()
+
+    local windowsPath = path:gsub("/", "\\")
+    local cmd = 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command '
+        .. '"$p = New-Object Media.SoundPlayer \'' .. windowsPath .. '\'; $p.Load(); '
+        .. 'while (($line = [Console]::In.ReadLine()) -ne $null) { $p.Play() }"'
+    return io.popen(cmd, "w")
 end
 
--- Playback methods, tried via J to find one that is audible in this game
-local SoundMethods = {
-    {"PlaySound2D (world context)", function(sound, volume)
-        UEHelpers.GetGameplayStatics():PlaySound2D(UEHelpers.GetWorldContextObject(), sound, volume, 1.0, 0.0, nil, nil, true)
-    end},
-    {"SpawnSound2D (player controller)", function(sound, volume)
-        local component = UEHelpers.GetGameplayStatics():SpawnSound2D(GetPlayerController(), sound, volume, 1.0, 0.0, nil, false, true)
-        local valid = component ~= nil and component:IsValid()
-        print("BlackoutMod:   AudioComponent valid: " .. tostring(valid))
-        if valid then
-            ExecuteInGameThreadWithDelay(300, function()
-                pcall(function()
-                    print("BlackoutMod:   IsPlaying after 300ms: " .. tostring(component:IsPlaying()))
-                end)
-            end)
-        end
-    end},
-    {"PlaySoundAtLocation (player position)", function(sound, volume)
-        local loc = GetPlayerLocation()
-        if not loc then error("no player location") end
-        UEHelpers.GetGameplayStatics():PlaySoundAtLocation(GetPlayerController(), sound,
-            {X = loc.X, Y = loc.Y, Z = loc.Z}, {Pitch = 0, Yaw = 0, Roll = 0}, volume, 1.0, 0.0, nil, nil, nil, nil)
-    end},
-}
-local SoundMethodIndex = 1  -- Used by PlaySound2D, switch once we know which one works
-
--- Must run on the game thread. Plays a game sound asset for the local player only
--- (every client plays it itself when the blackout syncs).
-function PlaySound2D(path, volume, methodIndex)
+function PlayWavFile(path)
     if not path or path == "" then return end
-    local method = SoundMethods[methodIndex or SoundMethodIndex]
 
     local success, err = pcall(function()
-        method[2](FindSound(path), volume)
+        if SoundPlayers[path] == nil then
+            SoundPlayers[path] = StartSoundPlayer(path) or false
+        end
+        local pipe = SoundPlayers[path]
+        if not pipe then return end
+
+        local ok, writeErr = pcall(function()
+            pipe:write("play\n")
+            pipe:flush()
+        end)
+        if not ok then
+            -- Player died: start a new one next time
+            SoundPlayers[path] = nil
+            error(writeErr)
+        end
     end)
 
-    if not success and not SoundErrorsLogged[path .. method[1]] then
-        print("BlackoutMod: ERROR playing sound " .. path .. " (" .. method[1] .. "): " .. tostring(err))
-        SoundErrorsLogged[path .. method[1]] = true
+    if not success and not SoundErrorLogged then
+        print("BlackoutMod: ERROR playing sound: " .. tostring(err))
+        SoundErrorLogged = true
     end
 end
+
+-- Start the player at load time so the first blackout has no PowerShell startup delay
+function PreloadSound(path)
+    if not path or path == "" then return end
+    pcall(function()
+        SoundPlayers[path] = StartSoundPlayer(path) or false
+    end)
+end
+
+PreloadSound(FlickerSoundFile)
 
 -- ============================================
 -- PROXIMITY & PLAYER FUNCTIONS
@@ -724,6 +728,8 @@ local FlickerId = 0  -- Increments per blackout so steps of an older flicker get
 -- Must run on the game thread. Flickers the lights, then calls SetBlackout(true),
 -- unless the blackout was repaired in the meantime.
 function StartBlackout()
+    PlayWavFile(FlickerSoundFile)
+
     if not FlickerBeforeBlackout then
         SetBlackout(true)
         return
@@ -759,9 +765,6 @@ function StartBlackout()
             SetLightsVisible(lights, visible)
             RunCommand(string.format("r.ExposureOffset %g", visible and normalExposure or -15))
             RunCommand(string.format("gamma %g", visible and normalGamma or 0.5))
-            if not visible then
-                PlaySound2D(FlickerSoundPath, FlickerSoundVolume)
-            end
         end)
     end
 
@@ -1101,42 +1104,6 @@ RegisterKeyBind(Key.I, function()
     end)
 end)
 
--- J = Preview sound candidates (DebugForceDissident only), to pick FlickerSoundPath
-local SoundCandidates = {
-    "/Game/World/Bullet_Travel/MS_BulletImpact_Spark.MS_BulletImpact_Spark",
-    "/Game/World/MapCommunication/AlarmSound_01.AlarmSound_01",
-    "/Game/Audio/Files/Interactions/Buttons/Kitchen_Button_Click_1.Kitchen_Button_Click_1",
-    "/Game/Audio/Files/Interactions/ContainerSlot/ContainerSlot_Click.ContainerSlot_Click",
-    "/Game/Audio/Files/Weapons/Light_Shot.Light_Shot",
-    "/Game/Character/Audio/MS_LightFall.MS_LightFall",
-}
--- Each press plays the next sound with the next method:
--- first all methods with the alarm (loud and long), then the other candidates
-local SoundTests = {}
-for methodIndex = 1, #SoundMethods do
-    table.insert(SoundTests, {SoundCandidates[2], methodIndex})
-end
-for i, path in ipairs(SoundCandidates) do
-    if i ~= 2 then
-        for methodIndex = 1, #SoundMethods do
-            table.insert(SoundTests, {path, methodIndex})
-        end
-    end
-end
-local SoundTestIndex = 0
-
-RegisterKeyBind(Key.J, function()
-    if not DebugForceDissident then return end
-
-    ExecuteInGameThread(function()
-        SoundTestIndex = SoundTestIndex % #SoundTests + 1
-        local test = SoundTests[SoundTestIndex]
-        print("BlackoutMod: Sound test " .. SoundTestIndex .. "/" .. #SoundTests .. ": "
-            .. test[1]:match("[^/]+$") .. " via " .. SoundMethods[test[2]][1])
-        PlaySound2D(test[1], 1.0, test[2])
-    end)
-end)
-
 -- K = Diagnose (DebugForceDissident only): dumps the prompt widget and loaded sounds,
 -- needed to decide how in-game messages and the blackout sound can be done
 function PrintClassMembers(label, obj)
@@ -1250,7 +1217,6 @@ print("Press L for Lobby Code Info")
 print("Press I for Debug Info (check role & sync status)")
 if DebugForceDissident then
     print("Press K for Diagnose (widget & sounds)")
-    print("Press J to preview sounds")
 end
 print("==========================================")
 if DebugForceDissident then
