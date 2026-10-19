@@ -63,9 +63,19 @@ function LoadConfig()
         local maxSabo = file:read("*l")
         file:close()
 
-        if code and #code >= 4 then
-            LobbyCode = code:sub(1, 8):gsub("%s+", "")
-            print("BlackoutMod: Loaded Lobby Code: " .. LobbyCode)
+        if code then
+            -- Same truncation as v2.5 so existing codes still match; only characters
+            -- that are safe in the server URL and the curl command line are kept
+            local cleaned = code:sub(1, 8):gsub("[^%w_%-]", "")
+            if #cleaned >= 4 then
+                LobbyCode = cleaned
+                print("BlackoutMod: Loaded Lobby Code: " .. LobbyCode)
+                if #LobbyCode < 6 then
+                    print("BlackoutMod: WARNING: Short lobby codes are easy to guess, use 6-8 characters!")
+                end
+            else
+                print("BlackoutMod: Invalid lobby code in config.txt (need 4-8 letters/digits)")
+            end
         end
 
         if maxSabo then
@@ -169,7 +179,7 @@ function SendHttpRequest(action, waitForResponse)
     if action == "sabotage" then
         -- Write true to Firebase
         local data = '{\\"isBlackout\\":true,\\"timestamp\\":' .. os.time() .. '}'
-        local cmd = string.format('curl -s -L -k -X PUT -H "Content-Type: application/json" -d "%s" "%s"', data, url)
+        local cmd = string.format('curl -s -L -X PUT -H "Content-Type: application/json" -d "%s" "%s"', data, url)
         
         local handle = io.popen(cmd)
         if handle then
@@ -180,7 +190,7 @@ function SendHttpRequest(action, waitForResponse)
     elseif action == "repair" then
         -- Write false to Firebase
         local data = '{\\"isBlackout\\":false,\\"timestamp\\":' .. os.time() .. '}'
-        local cmd = string.format('curl -s -L -k -X PUT -H "Content-Type: application/json" -d "%s" "%s"', data, url)
+        local cmd = string.format('curl -s -L -X PUT -H "Content-Type: application/json" -d "%s" "%s"', data, url)
         
         local handle = io.popen(cmd)
         if handle then
@@ -191,7 +201,7 @@ function SendHttpRequest(action, waitForResponse)
     elseif action == "status" and waitForResponse then
         -- Read from Firebase
         local fullUrl = url .. "?nocache=" .. tostring(randomId)
-        local cmd = string.format('curl -s -L -k "%s"', fullUrl)
+        local cmd = string.format('curl -s -L "%s"', fullUrl)
         local handle = io.popen(cmd)
         if not handle then return nil end
         local result = handle:read("*a")

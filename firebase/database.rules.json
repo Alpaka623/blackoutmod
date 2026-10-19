@@ -1,0 +1,24 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "lobbies": {
+      "$code": {
+        "blackout": {
+          ".read": "$code.length >= 4 && $code.length <= 8 && $code.matches(/^[A-Za-z0-9_-]+$/)",
+          ".write": "$code.length >= 4 && $code.length <= 8 && $code.matches(/^[A-Za-z0-9_-]+$/)",
+          ".validate": "newData.hasChildren(['isBlackout', 'timestamp'])",
+          "isBlackout": {
+            ".validate": "newData.isBoolean()"
+          },
+          "timestamp": {
+            ".validate": "newData.isNumber()"
+          },
+          "$other": {
+            ".validate": false
+          }
+        }
+      }
+    }
+  }
+}

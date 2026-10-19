@@ -28,28 +28,50 @@ echo   - Host shares code with friends ^(voice/discord^)
 echo   - Everyone enters the SAME code
 echo   - You're all synchronized!
 echo.
-echo Enter your lobby code ^(4-8 digits/letters^):
-echo   Choose unique code ^(e.g., 8472^)
+echo Enter your lobby code ^(4-8 letters/digits, 6-8 recommended^):
+echo   - Joining friends? Enter THEIR code
+echo   - Hosting? Just press Enter to get a random code
 echo.
 
+:ask_code
+set "LOBBY_CODE="
 set /p LOBBY_CODE="Lobby Code: "
+
+REM Empty checks use "defined": substitutions on an undefined variable don't expand to ""
+if not defined LOBBY_CODE goto :no_code
 
 REM Remove quotes if user pasted them
 set LOBBY_CODE=!LOBBY_CODE:"=!
 
-REM Validate input
-if "!LOBBY_CODE!"=="" (
-    echo.
-    echo ERROR: Code cannot be empty!
-    echo Using default code: 0000
-    set LOBBY_CODE=0000
-)
-
 REM Remove spaces
 set "LOBBY_CODE=!LOBBY_CODE: =!"
 
+if defined LOBBY_CODE goto :have_code
+
+:no_code
+REM Empty input: generate a random code (short codes are easy to guess)
+call :random_code
+echo.
+echo Generated random code: !LOBBY_CODE!
+echo Share this code with your friends!
+
+:have_code
+
 REM Limit to 8 characters
 set "LOBBY_CODE=!LOBBY_CODE:~0,8!"
+
+REM At least 4 characters, otherwise the mod ignores the code
+if "!LOBBY_CODE:~3,1!"=="" (
+    echo.
+    echo ERROR: Code must be at least 4 characters!
+    echo.
+    goto :ask_code
+)
+
+if "!LOBBY_CODE:~5,1!"=="" (
+    echo.
+    echo WARNING: Short codes are easy to guess. 6-8 characters are safer.
+)
 
 echo.
 echo [OK] Lobby code set: !LOBBY_CODE!
@@ -348,3 +370,14 @@ echo Need help? Check the README.md or Nexus Mods page.
 echo.
 echo Press any key to exit...
 pause >nul
+exit /b 0
+
+REM Generates an 8 character code (no l/o/0/1 to avoid mix-ups)
+:random_code
+set "CHARS=abcdefghijkmnpqrstuvwxyz23456789"
+set "LOBBY_CODE="
+for /l %%i in (1,1,8) do (
+    set /a "IDX=!RANDOM! %% 32"
+    for %%j in (!IDX!) do set "LOBBY_CODE=!LOBBY_CODE!!CHARS:~%%j,1!"
+)
+exit /b 0
