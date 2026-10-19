@@ -9,6 +9,10 @@ local MaxSabotagesPerRound = 1  -- 0 = unlimited, any other number = max sabotag
 local DebugForceDissident = false  -- TESTING ONLY: always treat local player as Dissident (keep false for release!)
 local MaxBlackoutDuration = 0  -- Seconds until lights come back automatically (0 = off, e.g. 180)
 local AllowManualRepair = false  -- P key repair (always allowed while DebugForceDissident is on)
+local SabotageCooldown = 0  -- Seconds after the lights come back before the next sabotage (0 = off)
+local FlickerBeforeBlackout = true  -- Lights flicker briefly before going out
+local FlickerSoundPath = "/Game/World/Bullet_Travel/MS_BulletImpact_Spark.MS_BulletImpact_Spark"  -- Played on each flicker, "" = no sound
+local FlickerSoundVolume = 1.0
 -- ============================================
 -- CONFIGURATION END
 -- ============================================
@@ -30,6 +34,7 @@ local RoleCacheTimeout = 2000     -- Cache for 2 seconds
 local CurrentServerState = false
 local SabotageCount = 0
 local LastSabotageTime = -100
+local LastBlackoutEndTime = -100000  -- os.clock() when the lights last came back (for the cooldown)
 local PlayersAliveAtStart = 0
 local LivingPawnsAtStart = {}  -- FullName -> true, pawns alive when the blackout started
 
@@ -61,6 +66,8 @@ function LoadConfig()
         local code = file:read("*l")
         -- Line 2: Max Sabotages Per Round
         local maxSabo = file:read("*l")
+        -- Line 3: Cooldown in seconds (optional, missing in v2.5 configs)
+        local cooldown = file:read("*l")
         file:close()
 
         if code then
@@ -84,6 +91,14 @@ function LoadConfig()
             if num and num >= 0 then
                 MaxSabotagesPerRound = math.floor(num)
                 print("BlackoutMod: Max Sabotages Per Round: " .. (MaxSabotagesPerRound == 0 and "unlimited" or tostring(MaxSabotagesPerRound)))
+            end
+        end
+
+        if cooldown then
+            local num = tonumber((cooldown:gsub("[^%d]", "")))
+            if num and num >= 0 then
+                SabotageCooldown = math.floor(num)
+                print("BlackoutMod: Sabotage Cooldown: " .. (SabotageCooldown == 0 and "off" or (SabotageCooldown .. "s")))
             end
         end
 
@@ -341,12 +356,72 @@ function HidePromptWidget()
 end
 
 -- ============================================
+-- SOUND
+-- ============================================
+
+local SoundErrorsLogged = {}
+
+function FindSound(path)
+    local sound = StaticFindObject(path)
+    if not sound or not sound:IsValid() then
+        sound = LoadAsset(path)
+    end
+    if not sound or not sound:IsValid() then
+        error("sound not found")
+    end
+    return sound
+end
+
+-- Playback methods, tried via J to find one that is audible in this game
+local SoundMethods = {
+    {"PlaySound2D (world context)", function(sound, volume)
+        UEHelpers.GetGameplayStatics():PlaySound2D(UEHelpers.GetWorldContextObject(), sound, volume, 1.0, 0.0, nil, nil, true)
+    end},
+    {"SpawnSound2D (player controller)", function(sound, volume)
+        local component = UEHelpers.GetGameplayStatics():SpawnSound2D(GetPlayerController(), sound, volume, 1.0, 0.0, nil, false, true)
+        local valid = component ~= nil and component:IsValid()
+        print("BlackoutMod:   AudioComponent valid: " .. tostring(valid))
+        if valid then
+            ExecuteInGameThreadWithDelay(300, function()
+                pcall(function()
+                    print("BlackoutMod:   IsPlaying after 300ms: " .. tostring(component:IsPlaying()))
+                end)
+            end)
+        end
+    end},
+    {"PlaySoundAtLocation (player position)", function(sound, volume)
+        local loc = GetPlayerLocation()
+        if not loc then error("no player location") end
+        UEHelpers.GetGameplayStatics():PlaySoundAtLocation(GetPlayerController(), sound,
+            {X = loc.X, Y = loc.Y, Z = loc.Z}, {Pitch = 0, Yaw = 0, Roll = 0}, volume, 1.0, 0.0, nil, nil, nil, nil)
+    end},
+}
+local SoundMethodIndex = 1  -- Used by PlaySound2D, switch once we know which one works
+
+-- Must run on the game thread. Plays a game sound asset for the local player only
+-- (every client plays it itself when the blackout syncs).
+function PlaySound2D(path, volume, methodIndex)
+    if not path or path == "" then return end
+    local method = SoundMethods[methodIndex or SoundMethodIndex]
+
+    local success, err = pcall(function()
+        method[2](FindSound(path), volume)
+    end)
+
+    if not success and not SoundErrorsLogged[path .. method[1]] then
+        print("BlackoutMod: ERROR playing sound " .. path .. " (" .. method[1] .. "): " .. tostring(err))
+        SoundErrorsLogged[path .. method[1]] = true
+    end
+end
+
+-- ============================================
 -- PROXIMITY & PLAYER FUNCTIONS
 -- ============================================
 
 -- Cache charger locations to avoid accessing destroyed UObjects
 local CachedChargerLocations = {}
 local LastChargerScan = 0
+local ChargerScanErrorLogged = false
 local ChargerScanInterval = 2000  -- Rescan chargers every 2 seconds
 
 function ScanChargerLocations()
@@ -375,9 +450,10 @@ function ScanChargerLocations()
     end)
 
     if not scanSuccess then
-        if not ScanChargerLocations.errorLogged then
+        -- Plain local flag: a field on the function value (v2.5) raised a Lua error itself
+        if not ChargerScanErrorLogged then
             print("BlackoutMod: ERROR scanning chargers: " .. tostring(scanErr))
-            ScanChargerLocations.errorLogged = true
+            ChargerScanErrorLogged = true
         end
     end
 end
@@ -466,26 +542,116 @@ end
 -- BLACKOUT FUNCTIONS
 -- ============================================
 
-function SetBlackout(active)
-    local LightClasses = {"/Script/Engine.PointLightComponent", "/Script/Engine.SpotLightComponent", "/Script/Engine.RectLightComponent"}
+-- FindAllOf needs short class names; the v2.5 full paths ("/Script/Engine.PointLightComponent")
+-- found nothing, so only exposure/gamma made it dark
+local LightClasses = {"PointLightComponent", "SpotLightComponent", "RectLightComponent"}
 
-    for _, path in ipairs(LightClasses) do
+-- Full names of the lights the blackout (or flicker) turned off, so a repair only
+-- turns those back on and leaves lights alone that were off on purpose
+local HiddenLightNames = {}
+
+local PawnClass = nil
+
+-- Lights owned by a player (e.g. flashlights) stay on during the blackout
+function IsPlayerLight(light)
+    if not PawnClass or not PawnClass:IsValid() then
+        PawnClass = StaticFindObject("/Script/Engine.Pawn")
+    end
+    local isPlayer = false
+    pcall(function()
+        local owner = light:GetOwner()
+        if owner and owner:IsValid() then
+            if owner:IsA(PawnClass) then
+                isPlayer = true
+                return
+            end
+            -- Held items: owner of the owner is the pawn
+            local ownerOwner = owner:GetOwner()
+            if ownerOwner and ownerOwner:IsValid() and ownerOwner:IsA(PawnClass) then
+                isPlayer = true
+            end
+        end
+    end)
+    return isPlayer
+end
+
+function GetAllLights()
+    local result = {}
+    for _, className in ipairs(LightClasses) do
         local success, err = pcall(function()
-            local lights = FindAllOf(path)
+            local lights = FindAllOf(className)
             if lights then
                 for _, l in ipairs(lights) do
-                    -- Double-check validity with pcall per light to avoid C++ crash on destroyed components
-                    pcall(function()
-                        if l and l:IsValid() then
-                            l:SetVisibility(not active, false)
-                        end
-                    end)
+                    table.insert(result, l)
                 end
             end
         end)
         if not success then
-            print("BlackoutMod: ERROR toggling lights (" .. path .. "): " .. tostring(err))
+            print("BlackoutMod: ERROR finding lights (" .. className .. "): " .. tostring(err))
         end
+    end
+    return result
+end
+
+-- Lights that are currently on and not owned by a player
+function GetBlackoutLights()
+    local result = {}
+    local skipped = 0
+    for _, l in ipairs(GetAllLights()) do
+        pcall(function()
+            if l:IsValid() and l:IsVisible() then
+                if IsPlayerLight(l) then
+                    skipped = skipped + 1
+                else
+                    table.insert(result, l)
+                end
+            end
+        end)
+    end
+    return result, skipped
+end
+
+function RememberHiddenLights(lights)
+    for _, l in ipairs(lights) do
+        pcall(function()
+            HiddenLightNames[l:GetFullName()] = true
+        end)
+    end
+end
+
+function RestoreHiddenLights()
+    local restored = 0
+    for _, l in ipairs(GetAllLights()) do
+        pcall(function()
+            if l:IsValid() and HiddenLightNames[l:GetFullName()] then
+                l:SetVisibility(true, false)
+                restored = restored + 1
+            end
+        end)
+    end
+    HiddenLightNames = {}
+    return restored
+end
+
+function SetLightsVisible(lights, visible)
+    for _, l in ipairs(lights) do
+        -- Double-check validity with pcall per light to avoid C++ crash on destroyed components
+        pcall(function()
+            if l and l:IsValid() then
+                l:SetVisibility(visible, false)
+            end
+        end)
+    end
+end
+
+function SetBlackout(active)
+    if active then
+        local lights, skipped = GetBlackoutLights()
+        RememberHiddenLights(lights)
+        SetLightsVisible(lights, false)
+        print("BlackoutMod: Lights off: " .. #lights .. " (player lights kept on: " .. skipped .. ")")
+    else
+        print("BlackoutMod: Lights restored: " .. RestoreHiddenLights())
     end
 
     if active then
@@ -550,11 +716,77 @@ function ReadGraphicsSettings()
     return settings
 end
 
+-- Flicker pattern before the blackout: {ms after start, lights visible}
+local FlickerPattern = {{0, false}, {120, true}, {300, false}, {420, true}, {700, false}, {800, true}}
+local FlickerDuration = 1200  -- ms until the actual blackout
+local FlickerId = 0  -- Increments per blackout so steps of an older flicker get dropped
+
+-- Must run on the game thread. Flickers the lights, then calls SetBlackout(true),
+-- unless the blackout was repaired in the meantime.
+function StartBlackout()
+    if not FlickerBeforeBlackout then
+        SetBlackout(true)
+        return
+    end
+
+    FlickerId = FlickerId + 1
+    local myId = FlickerId
+    local lights = GetBlackoutLights()
+    -- Remembered right away, so a repair during an "off" step still turns them back on
+    RememberHiddenLights(lights)
+
+    -- Only a few real light components exist and exposure changes fade in via eye
+    -- adaptation, so the flicker also switches gamma, which applies instantly.
+    -- SetBlackout keeps these saved values.
+    if not SavedGraphics then
+        SavedGraphics = ReadGraphicsSettings()
+    end
+    local normalExposure = SavedGraphics.ExposureOffset
+    local normalGamma = SavedGraphics.Gamma
+
+    print("BlackoutMod: Flicker started (" .. #lights .. " lights)")
+
+    local function stillWanted()
+        return myId == FlickerId and CurrentServerState
+    end
+
+    -- Game-thread timers: ExecuteWithDelay shares the async thread with the blocking
+    -- curl calls, so its steps arrived bunched together after ~800ms
+    for _, step in ipairs(FlickerPattern) do
+        ExecuteInGameThreadWithDelay(step[1], function()
+            if not stillWanted() then return end
+            local visible = step[2]
+            SetLightsVisible(lights, visible)
+            RunCommand(string.format("r.ExposureOffset %g", visible and normalExposure or -15))
+            RunCommand(string.format("gamma %g", visible and normalGamma or 0.5))
+            if not visible then
+                PlaySound2D(FlickerSoundPath, FlickerSoundVolume)
+            end
+        end)
+    end
+
+    ExecuteInGameThreadWithDelay(FlickerDuration, function()
+        if not stillWanted() then return end
+        local success, err = pcall(SetBlackout, true)
+        if not success then
+            print("BlackoutMod: FATAL ERROR in SetBlackout: " .. tostring(err))
+        end
+    end)
+end
+
+function GetCooldownRemaining()
+    if SabotageCooldown <= 0 then return 0 end
+    return math.max(0, SabotageCooldown - (os.clock() - LastBlackoutEndTime))
+end
+
 -- Must run on the game thread; the HTTP request itself runs async
 function ForceRepair(reason)
     print("BlackoutMod: REPAIR! Reason: " .. reason)
     SendHttpRequestAsync("repair")
     LastLocalChangeTime = os.clock()
+    if CurrentServerState then
+        LastBlackoutEndTime = os.clock()
+    end
     CurrentServerState = false
     SetBlackout(false)
 end
@@ -665,9 +897,14 @@ function ApplyServerState(serverBlackout, serverTimestamp)
             LastSabotageTime = os.clock()
         else
             print("BlackoutMod: SYNC -> Blackout DEACTIVATED (lights ON)")
+            LastBlackoutEndTime = os.clock()
         end
 
-        SetBlackout(CurrentServerState)
+        if serverBlackout then
+            StartBlackout()
+        else
+            SetBlackout(false)
+        end
     end
 end
 
@@ -700,11 +937,13 @@ LoopAsync(200, function()
             local nearCharger = CheckChargerProximity()
 
             -- Only check role if near charger
+            -- (Changing the prompt text from Lua is not possible: UE4SS can't construct
+            -- an FText in this game and the game crashes, so it is hidden during cooldown)
             local shouldShow = false
             if nearCharger then
                 local isDissident = IsPlayerDissident()  -- Now cached!
 
-                shouldShow = isDissident and (not CurrentServerState)
+                shouldShow = isDissident and (not CurrentServerState) and (GetCooldownRemaining() <= 0)
                 if MaxSabotagesPerRound > 0 then
                     shouldShow = shouldShow and (SabotageCount < MaxSabotagesPerRound)
                 end
@@ -753,6 +992,12 @@ function TrySabotage()
         return
     end
 
+    local cooldownLeft = GetCooldownRemaining()
+    if cooldownLeft > 0 then
+        print("BlackoutMod: Cooldown active, wait " .. math.ceil(cooldownLeft) .. "s")
+        return
+    end
+
     if MaxSabotagesPerRound > 0 and SabotageCount >= MaxSabotagesPerRound then
         print("BlackoutMod: Already sabotaged " .. SabotageCount .. "/" .. MaxSabotagesPerRound .. " this round!")
         return
@@ -776,11 +1021,9 @@ function TrySabotage()
     SendHttpRequestAsync("sabotage")
     CurrentServerState = true
 
-    local blSuccess, blErr = pcall(function()
-        SetBlackout(true)
-    end)
+    local blSuccess, blErr = pcall(StartBlackout)
     if not blSuccess then
-        print("BlackoutMod: FATAL ERROR in SetBlackout: " .. tostring(blErr))
+        print("BlackoutMod: FATAL ERROR in StartBlackout: " .. tostring(blErr))
     end
 end
 
@@ -858,6 +1101,130 @@ RegisterKeyBind(Key.I, function()
     end)
 end)
 
+-- J = Preview sound candidates (DebugForceDissident only), to pick FlickerSoundPath
+local SoundCandidates = {
+    "/Game/World/Bullet_Travel/MS_BulletImpact_Spark.MS_BulletImpact_Spark",
+    "/Game/World/MapCommunication/AlarmSound_01.AlarmSound_01",
+    "/Game/Audio/Files/Interactions/Buttons/Kitchen_Button_Click_1.Kitchen_Button_Click_1",
+    "/Game/Audio/Files/Interactions/ContainerSlot/ContainerSlot_Click.ContainerSlot_Click",
+    "/Game/Audio/Files/Weapons/Light_Shot.Light_Shot",
+    "/Game/Character/Audio/MS_LightFall.MS_LightFall",
+}
+-- Each press plays the next sound with the next method:
+-- first all methods with the alarm (loud and long), then the other candidates
+local SoundTests = {}
+for methodIndex = 1, #SoundMethods do
+    table.insert(SoundTests, {SoundCandidates[2], methodIndex})
+end
+for i, path in ipairs(SoundCandidates) do
+    if i ~= 2 then
+        for methodIndex = 1, #SoundMethods do
+            table.insert(SoundTests, {path, methodIndex})
+        end
+    end
+end
+local SoundTestIndex = 0
+
+RegisterKeyBind(Key.J, function()
+    if not DebugForceDissident then return end
+
+    ExecuteInGameThread(function()
+        SoundTestIndex = SoundTestIndex % #SoundTests + 1
+        local test = SoundTests[SoundTestIndex]
+        print("BlackoutMod: Sound test " .. SoundTestIndex .. "/" .. #SoundTests .. ": "
+            .. test[1]:match("[^/]+$") .. " via " .. SoundMethods[test[2]][1])
+        PlaySound2D(test[1], 1.0, test[2])
+    end)
+end)
+
+-- K = Diagnose (DebugForceDissident only): dumps the prompt widget and loaded sounds,
+-- needed to decide how in-game messages and the blackout sound can be done
+function PrintClassMembers(label, obj)
+    pcall(function()
+        local class = obj:GetClass()
+        print(label .. " class: " .. class:GetFullName())
+        local names = {}
+        class:ForEachFunction(function(func)
+            table.insert(names, func:GetFName():ToString())
+        end)
+        print("  Functions: " .. table.concat(names, ", "))
+        names = {}
+        class:ForEachProperty(function(prop)
+            table.insert(names, prop:GetFName():ToString())
+        end)
+        print("  Properties: " .. table.concat(names, ", "))
+    end)
+end
+
+local SoundKeywords = {"light", "power", "elec", "buzz", "switch", "spark", "fuse", "generat",
+    "hum", "alarm", "shut", "flicker", "breaker", "lamp", "neon", "blackout", "down", "click", "zap"}
+
+function PrintSounds(className)
+    local all = FindAllOf(className) or {}
+    print(className .. ": " .. #all .. " loaded")
+    local shown = 0
+    for _, sound in ipairs(all) do
+        local name = ""
+        pcall(function() name = sound:GetFullName() end)
+        local lower = name:lower()
+        for _, keyword in ipairs(SoundKeywords) do
+            if lower:find(keyword, 1, true) then
+                print("  " .. name)
+                shown = shown + 1
+                break
+            end
+        end
+        if shown >= 60 then
+            print("  ... (more)")
+            break
+        end
+    end
+end
+
+RegisterKeyBind(Key.K, function()
+    if not DebugForceDissident then return end
+
+    ExecuteInGameThread(function()
+        print("==========================================")
+        print("BlackoutMod: DIAGNOSE")
+        print("==========================================")
+
+        if not ModActor or not ModActor:IsValid() then
+            FindModActor()
+        end
+
+        if ModActor and ModActor:IsValid() then
+            PrintClassMembers("ModActor", ModActor)
+
+            local widget = nil
+            pcall(function() widget = ModActor:GetPropertyValue("TextWidget") end)
+            if widget and widget:IsValid() then
+                PrintClassMembers("TextWidget", widget)
+
+                local widgetName = widget:GetFName():ToString()
+                for _, textBlock in ipairs(FindAllOf("TextBlock") or {}) do
+                    local fullName = textBlock:GetFullName()
+                    if fullName:find(widgetName, 1, true) then
+                        local text = "?"
+                        pcall(function() text = textBlock:GetText():ToString() end)
+                        print("  TextBlock: " .. fullName .. " = \"" .. tostring(text) .. "\"")
+                    end
+                end
+            else
+                print("TextWidget: not found")
+            end
+        else
+            print("ModActor: not found")
+        end
+
+        print("")
+        PrintSounds("SoundCue")
+        PrintSounds("SoundWave")
+        PrintSounds("MetaSoundSource")
+        print("==========================================")
+    end)
+end)
+
 print("==========================================")
 print("BlackoutMod LOADED")
 print("==========================================")
@@ -876,8 +1243,15 @@ end
 if MaxBlackoutDuration > 0 then
     print("Blackouts end automatically after " .. MaxBlackoutDuration .. "s")
 end
+if SabotageCooldown > 0 then
+    print("Cooldown between blackouts: " .. SabotageCooldown .. "s")
+end
 print("Press L for Lobby Code Info")
 print("Press I for Debug Info (check role & sync status)")
+if DebugForceDissident then
+    print("Press K for Diagnose (widget & sounds)")
+    print("Press J to preview sounds")
+end
 print("==========================================")
 if DebugForceDissident then
     print("")

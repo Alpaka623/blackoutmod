@@ -16,7 +16,7 @@ pause >nul
 cls
 
 echo ==========================================
-echo    Step 1/4: Configure Lobby Code
+echo    Step 1/6: Configure Lobby Code
 echo ==========================================
 echo.
 echo BlackoutMod uses a shared server with lobby codes.
@@ -80,7 +80,7 @@ timeout /t 1 >nul
 cls
 
 echo ==========================================
-echo    Step 2/5: Sabotage Limit
+echo    Step 2/6: Sabotage Limit
 echo ==========================================
 echo.
 echo How many times can a Dissident sabotage per round?
@@ -115,7 +115,44 @@ timeout /t 1 >nul
 cls
 
 echo ==========================================
-echo    Step 3/5: Checking Files
+echo    Step 3/6: Sabotage Cooldown
+echo ==========================================
+echo.
+echo How many seconds must pass after the lights come back
+echo before the next sabotage is possible?
+echo.
+echo   0   = No cooldown
+echo   60  = 1 minute ^(recommended with 2+ sabotages per round^)
+echo   120 = 2 minutes
+echo.
+echo All players should use the same value.
+echo.
+set "COOLDOWN="
+set /p COOLDOWN="Cooldown in seconds [0]: "
+
+if not defined COOLDOWN set COOLDOWN=0
+
+REM Validate: must be a number >= 0
+set "VALID_NUM=true"
+for /f "delims=0123456789" %%a in ("!COOLDOWN!") do set "VALID_NUM=false"
+if "!VALID_NUM!"=="false" (
+    echo.
+    echo WARNING: Invalid input, using default: 0
+    set COOLDOWN=0
+)
+
+echo.
+if "!COOLDOWN!"=="0" (
+    echo [OK] Cooldown: Off
+) else (
+    echo [OK] Cooldown: !COOLDOWN! seconds
+)
+echo.
+timeout /t 1 >nul
+cls
+
+echo ==========================================
+echo    Step 4/6: Checking Files
 echo ==========================================
 echo.
 
@@ -145,7 +182,7 @@ timeout /t 1 >nul
 cls
 
 echo ==========================================
-echo    Step 4/5: Locating Game
+echo    Step 5/6: Locating Game
 echo ==========================================
 echo.
 
@@ -197,7 +234,7 @@ timeout /t 1 >nul
 cls
 
 echo ==========================================
-echo    Step 5/5: Installing BlackoutMod
+echo    Step 6/6: Installing BlackoutMod
 echo ==========================================
 echo.
 
@@ -255,6 +292,7 @@ echo [3/4] Configuring mod settings...
 (
     echo !LOBBY_CODE!
     echo !MAX_SABO!
+    echo !COOLDOWN!
 )>"!LUA_TARGET!\config.txt"
 
 if errorlevel 1 (
@@ -268,6 +306,7 @@ if errorlevel 1 (
     ) else (
         echo [OK] Sabotage limit: !MAX_SABO!x per round
     )
+    echo [OK] Cooldown: !COOLDOWN! seconds
 )
 
 echo.
@@ -308,6 +347,7 @@ if "!MAX_SABO!"=="0" (
 ) else (
     echo [X] Sabotage Limit: !MAX_SABO!x per round
 )
+echo [X] Cooldown: !COOLDOWN! seconds ^(0 = off^)
 echo.
 echo Installation location:
 echo !GAME_PATH!
@@ -331,6 +371,7 @@ echo   Option 1: Edit config.txt manually
 echo            ^(!LUA_TARGET!\config.txt^)
 echo            Line 1 = Lobby Code
 echo            Line 2 = Max Sabotages ^(0 = unlimited^)
+echo            Line 3 = Cooldown in seconds ^(0 = off^)
 echo   Option 2: Run this installer again
 echo   Option 3: Press L in-game for lobby code instructions
 echo.
