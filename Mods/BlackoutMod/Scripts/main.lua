@@ -1,20 +1,25 @@
 local ModName = "BlackoutMod"
+local ModVersion = "3.0.0"
 local ServerUrl = "https://blackoutmod-shared-default-rtdb.firebaseio.com/lobbies"
-local LobbyCode = "0000"  -- Default, loaded from config.txt
 
 -- ============================================
 -- CONFIGURATION
 -- ============================================
-local MaxSabotagesPerRound = 1  -- 0 = unlimited, any other number = max sabotages per round per dissident
 local DebugForceDissident = false  -- TESTING ONLY: always treat local player as Dissident (keep false for release!)
-local MaxBlackoutDuration = 0  -- Seconds until lights come back automatically (0 = off, e.g. 180)
 local AllowManualRepair = false  -- P key repair (always allowed while DebugForceDissident is on)
-local SabotageCooldown = 0  -- Seconds after the lights come back before the next sabotage (0 = off)
-local FlickerBeforeBlackout = true  -- Lights flicker briefly before going out
-local FlickerSoundFile = "ue4ss/Mods/BlackoutMod/Sounds/flicker.wav"  -- Played when the blackout starts, "" = no sound
+local FlickerSoundFile = "ue4ss/Mods/BlackoutMod/Sounds/flicker.wav"
 -- ============================================
 -- CONFIGURATION END
 -- ============================================
+
+-- Settings below come from config.txt (see LoadConfig). The lobby settings
+-- (sabotages, cooldown, duration) are replaced by the lobby host's
+-- values from the server when the lobby has some.
+local LobbyCode = "0000"
+local OwnerKey = ""  -- Only the lobby host has one; allows changing the shared settings
+local MaxSabotagesPerRound = 1  -- 0 = unlimited, any other number = max sabotages per round per dissident
+local SabotageCooldown = 0  -- Seconds after the lights come back before the next sabotage (0 = off)
+local MaxBlackoutDuration = 0  -- Seconds until lights come back automatically (0 = off)
 
 local UEHelpers = require("UEHelpers")
 
@@ -53,60 +58,98 @@ local ModActor = nil
 -- LOBBY CODE LOADING
 -- ============================================
 
+function ParseBool(value)
+    value = value:lower()
+    if value == "true" or value == "1" or value == "yes" or value == "on" then return true end
+    if value == "false" or value == "0" or value == "no" or value == "off" then return false end
+    return nil
+end
+
+function ParseCount(value, max)
+    local num = tonumber((value:gsub("[^%d]", "")))
+    if num then return math.min(math.floor(num), max) end
+    return nil
+end
+
+function SetLobbyCode(code)
+    -- Same truncation as v2.5 so existing codes still match; only characters
+    -- that are safe in the server URL and the curl command line are kept
+    local cleaned = code:sub(1, 8):gsub("[^%w_%-]", "")
+    if #cleaned >= 4 then
+        LobbyCode = cleaned
+        return true
+    end
+    print("BlackoutMod: Invalid lobby code in config.txt (need 4-8 letters/digits)")
+    return false
+end
+
+-- config.txt is "Key=Value" per line (written by install.bat, # = comment).
+-- Old v2.5 configs (line 1 code, line 2 max sabotages, line 3 cooldown) still work.
 function LoadConfig()
     local configPath = "ue4ss/Mods/BlackoutMod/config.txt"
+
+    -- Defaults, also when reloading
+    LobbyCode = "0000"
+    OwnerKey = ""
+    MaxSabotagesPerRound = 1
+    SabotageCooldown = 0
+    MaxBlackoutDuration = 0
 
     local success, file = pcall(function()
         return io.open(configPath, "r")
     end)
 
-    if success and file then
-        -- Line 1: Lobby Code
-        local code = file:read("*l")
-        -- Line 2: Max Sabotages Per Round
-        local maxSabo = file:read("*l")
-        -- Line 3: Cooldown in seconds (optional, missing in v2.5 configs)
-        local cooldown = file:read("*l")
-        file:close()
-
-        if code then
-            -- Same truncation as v2.5 so existing codes still match; only characters
-            -- that are safe in the server URL and the curl command line are kept
-            local cleaned = code:sub(1, 8):gsub("[^%w_%-]", "")
-            if #cleaned >= 4 then
-                LobbyCode = cleaned
-                print("BlackoutMod: Loaded Lobby Code: " .. LobbyCode)
-                if #LobbyCode < 6 then
-                    print("BlackoutMod: WARNING: Short lobby codes are easy to guess, use 6-8 characters!")
-                end
-            else
-                print("BlackoutMod: Invalid lobby code in config.txt (need 4-8 letters/digits)")
-            end
-        end
-
-        if maxSabo then
-            local cleaned = maxSabo:gsub("[^%d]", "")
-            local num = tonumber(cleaned)
-            if num and num >= 0 then
-                MaxSabotagesPerRound = math.floor(num)
-                print("BlackoutMod: Max Sabotages Per Round: " .. (MaxSabotagesPerRound == 0 and "unlimited" or tostring(MaxSabotagesPerRound)))
-            end
-        end
-
-        if cooldown then
-            local num = tonumber((cooldown:gsub("[^%d]", "")))
-            if num and num >= 0 then
-                SabotageCooldown = math.floor(num)
-                print("BlackoutMod: Sabotage Cooldown: " .. (SabotageCooldown == 0 and "off" or (SabotageCooldown .. "s")))
-            end
-        end
-
-        return true
+    if not (success and file) then
+        print("BlackoutMod: No config found, using defaults (Code: " .. LobbyCode .. ")")
+        print("BlackoutMod: Run install.bat to configure!")
+        return false
     end
 
-    print("BlackoutMod: No config found, using defaults (Code: " .. LobbyCode .. ", MaxSabo: " .. MaxSabotagesPerRound .. ")")
-    print("BlackoutMod: Run install.bat to configure!")
-    return false
+    local lines = {}
+    for line in file:lines() do
+        line = line:gsub("\r", "")
+        if not line:match("^%s*#") and line:match("%S") then
+            table.insert(lines, line)
+        end
+    end
+    file:close()
+
+    local isKeyValue = false
+    for _, line in ipairs(lines) do
+        if line:find("=", 1, true) then isKeyValue = true end
+    end
+
+    if isKeyValue then
+        for _, line in ipairs(lines) do
+            local key, value = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+            if key then
+                key = key:lower()
+                if key == "lobbycode" then
+                    SetLobbyCode(value)
+                elseif key == "ownerkey" then
+                    OwnerKey = value:gsub("[^%w_%-]", "")
+                elseif key == "maxsabotagesperround" then
+                    MaxSabotagesPerRound = ParseCount(value, 99) or MaxSabotagesPerRound
+                elseif key == "cooldown" then
+                    SabotageCooldown = ParseCount(value, 3600) or SabotageCooldown
+                elseif key == "maxblackoutduration" then
+                    MaxBlackoutDuration = ParseCount(value, 3600) or MaxBlackoutDuration
+                end
+            end
+        end
+    else
+        -- v2.5 format
+        if lines[1] then SetLobbyCode(lines[1]) end
+        if lines[2] then MaxSabotagesPerRound = ParseCount(lines[2], 99) or MaxSabotagesPerRound end
+        if lines[3] then SabotageCooldown = ParseCount(lines[3], 3600) or SabotageCooldown end
+    end
+
+    print("BlackoutMod: Loaded Lobby Code: " .. LobbyCode)
+    if #LobbyCode < 6 then
+        print("BlackoutMod: WARNING: Short lobby codes are easy to guess and can't have shared settings.")
+        print("BlackoutMod:          The lobby host should create a new lobby with install.bat (6-8 characters).")
+    end
+    return true
 end
 
 -- Load config on startup
@@ -260,6 +303,80 @@ function ParseJsonBool(jsonString, key)
     return nil
 end
 
+-- Runs curl and returns body, HTTP status. Blocking: call off the game thread.
+function CurlRequest(method, url, jsonBody)
+    local cmd
+    if jsonBody then
+        local escaped = jsonBody:gsub('"', '\\"')
+        cmd = string.format('curl -s -L -X %s -H "Content-Type: application/json" -d "%s" -w "\\n%%{http_code}" "%s"',
+            method, escaped, url)
+    else
+        cmd = string.format('curl -s -L -w "\\n%%{http_code}" "%s"', url)
+    end
+
+    local handle = io.popen(cmd)
+    if not handle then return nil, nil end
+    local result = handle:read("*a")
+    handle:close()
+
+    local body, status = result:match("^(.*)\n(%d+)%s*$")
+    return body, tonumber(status)
+end
+
+-- ============================================
+-- SHARED LOBBY SETTINGS
+-- ============================================
+-- The lobby host (has OwnerKey in config.txt) uploads their settings, everyone
+-- else downloads them. Only at start and on F5. The server rules only accept
+-- uploads with the host's key, and the key itself can't be read.
+
+function DescribeLobbySettings()
+    return string.format("Sabotages/round: %s, Cooldown: %s, Max duration: %s",
+        MaxSabotagesPerRound == 0 and "unlimited" or tostring(MaxSabotagesPerRound),
+        SabotageCooldown == 0 and "off" or (SabotageCooldown .. "s"),
+        MaxBlackoutDuration == 0 and "off" or (MaxBlackoutDuration .. "s"))
+end
+
+function SyncLobbySettings()
+    RunAsync(function()
+        local success, err = pcall(function()
+            local url = ServerUrl .. "/" .. LobbyCode .. "/settings"
+
+            if OwnerKey ~= "" then
+                local values = string.format('{"maxSabotages":%d,"cooldown":%d,"maxDuration":%d}',
+                    MaxSabotagesPerRound, SabotageCooldown, MaxBlackoutDuration)
+                local _, status = CurlRequest("PUT", url .. ".json", '{"key":"' .. OwnerKey .. '","values":' .. values .. '}')
+                if status == 200 then
+                    print("BlackoutMod: You are the lobby host, settings shared with all players:")
+                else
+                    print("BlackoutMod: WARNING: Could not share lobby settings (HTTP " .. tostring(status) .. ").")
+                    print("BlackoutMod:          OwnerKey doesn't match this lobby? Using your settings only locally:")
+                end
+                print("BlackoutMod:   " .. DescribeLobbySettings())
+                return
+            end
+
+            local body = CurlRequest("GET", url .. "/values.json")
+            local maxSabotages = ParseJsonNumber(body, "maxSabotages")
+            local cooldown = ParseJsonNumber(body, "cooldown")
+            local maxDuration = ParseJsonNumber(body, "maxDuration")
+
+            if maxSabotages and cooldown and maxDuration then
+                MaxSabotagesPerRound = math.floor(maxSabotages)
+                SabotageCooldown = math.floor(cooldown)
+                MaxBlackoutDuration = math.floor(maxDuration)
+                print("BlackoutMod: Using the lobby host's settings:")
+            else
+                print("BlackoutMod: This lobby has no shared settings, using config.txt:")
+            end
+            print("BlackoutMod:   " .. DescribeLobbySettings())
+        end)
+        if not success then
+            print("BlackoutMod: ERROR syncing lobby settings: " .. tostring(err))
+        end
+    end)
+end
+
 -- ============================================
 -- GAME UTILITY FUNCTIONS
 -- ============================================
@@ -363,21 +480,24 @@ end
 -- A PowerShell player is started once and preloads the file; each line written to
 -- its stdin plays it. Starting PowerShell per sound took too long (sound came after
 -- the flicker). The player exits by itself when the game closes (stdin closes).
+-- It also turns off QuickEdit for the shared UE4SS console, see sound_player.ps1.
+local SoundPlayerScript = "ue4ss/Mods/BlackoutMod/Scripts/sound_player.ps1"
 local SoundPlayers = {}  -- path -> pipe to the player's stdin
 local SoundErrorLogged = false
 
 function StartSoundPlayer(path)
-    local file = io.open(path, "rb")
-    if not file then
-        print("BlackoutMod: Sound file not found: " .. path)
-        return nil
+    for _, required in ipairs({path, SoundPlayerScript}) do
+        local file = io.open(required, "rb")
+        if not file then
+            print("BlackoutMod: File not found: " .. required)
+            return nil
+        end
+        file:close()
     end
-    file:close()
 
-    local windowsPath = path:gsub("/", "\\")
-    local cmd = 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command '
-        .. '"$p = New-Object Media.SoundPlayer \'' .. windowsPath .. '\'; $p.Load(); '
-        .. 'while (($line = [Console]::In.ReadLine()) -ne $null) { $p.Play() }"'
+    -- No -WindowStyle Hidden: the player shares the UE4SS console and would hide it
+    local cmd = string.format('powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%s" "%s"',
+        (SoundPlayerScript:gsub("/", "\\")), (path:gsub("/", "\\")))
     return io.popen(cmd, "w")
 end
 
@@ -730,11 +850,6 @@ local FlickerId = 0  -- Increments per blackout so steps of an older flicker get
 function StartBlackout()
     PlayWavFile(FlickerSoundFile)
 
-    if not FlickerBeforeBlackout then
-        SetBlackout(true)
-        return
-    end
-
     FlickerId = FlickerId + 1
     local myId = FlickerId
     local lights = GetBlackoutLights()
@@ -1039,15 +1154,12 @@ RegisterKeyBind(Key.L, function()
     print("==========================================")
     print("BlackoutMod: LOBBY CODE INFO")
     print("==========================================")
-    print("Current code: " .. LobbyCode)
+    print("Current code: " .. LobbyCode .. (OwnerKey ~= "" and " (you are the host)" or ""))
+    print("Settings: " .. DescribeLobbySettings())
     print("")
-    print("To change code:")
-    print("1. Exit game")
-    print("2. Edit: Mods/BlackoutMod/config.txt")
-    print("3. Enter your 4-8 digit lobby code")
-    print("4. Save and restart game")
-    print("")
-    print("OR run install.bat to set code automatically")
+    print("To change code or settings:")
+    print("- Run install.bat again (create or join a lobby)")
+    print("- OR edit ue4ss/Mods/BlackoutMod/config.txt and press F5 in-game")
     print("")
     print("Make sure everyone uses the SAME code!")
     print("==========================================")
@@ -1104,120 +1216,36 @@ RegisterKeyBind(Key.I, function()
     end)
 end)
 
--- K = Diagnose (DebugForceDissident only): dumps the prompt widget and loaded sounds,
--- needed to decide how in-game messages and the blackout sound can be done
-function PrintClassMembers(label, obj)
-    pcall(function()
-        local class = obj:GetClass()
-        print(label .. " class: " .. class:GetFullName())
-        local names = {}
-        class:ForEachFunction(function(func)
-            table.insert(names, func:GetFName():ToString())
-        end)
-        print("  Functions: " .. table.concat(names, ", "))
-        names = {}
-        class:ForEachProperty(function(prop)
-            table.insert(names, prop:GetFName():ToString())
-        end)
-        print("  Properties: " .. table.concat(names, ", "))
-    end)
-end
-
-local SoundKeywords = {"light", "power", "elec", "buzz", "switch", "spark", "fuse", "generat",
-    "hum", "alarm", "shut", "flicker", "breaker", "lamp", "neon", "blackout", "down", "click", "zap"}
-
-function PrintSounds(className)
-    local all = FindAllOf(className) or {}
-    print(className .. ": " .. #all .. " loaded")
-    local shown = 0
-    for _, sound in ipairs(all) do
-        local name = ""
-        pcall(function() name = sound:GetFullName() end)
-        local lower = name:lower()
-        for _, keyword in ipairs(SoundKeywords) do
-            if lower:find(keyword, 1, true) then
-                print("  " .. name)
-                shown = shown + 1
-                break
-            end
-        end
-        if shown >= 60 then
-            print("  ... (more)")
-            break
-        end
-    end
-end
-
-RegisterKeyBind(Key.K, function()
-    if not DebugForceDissident then return end
-
+-- F5 = Reload config.txt (and the lobby settings) without restarting the game
+RegisterKeyBind(Key.F5, function()
     ExecuteInGameThread(function()
-        print("==========================================")
-        print("BlackoutMod: DIAGNOSE")
-        print("==========================================")
+        print("BlackoutMod: Reloading config...")
+        local oldCode = LobbyCode
+        LoadConfig()
 
-        if not ModActor or not ModActor:IsValid() then
-            FindModActor()
+        -- Leaving a lobby during its blackout: lights back on locally only
+        if LobbyCode ~= oldCode and CurrentServerState then
+            CurrentServerState = false
+            SetBlackout(false)
         end
 
-        if ModActor and ModActor:IsValid() then
-            PrintClassMembers("ModActor", ModActor)
-
-            local widget = nil
-            pcall(function() widget = ModActor:GetPropertyValue("TextWidget") end)
-            if widget and widget:IsValid() then
-                PrintClassMembers("TextWidget", widget)
-
-                local widgetName = widget:GetFName():ToString()
-                for _, textBlock in ipairs(FindAllOf("TextBlock") or {}) do
-                    local fullName = textBlock:GetFullName()
-                    if fullName:find(widgetName, 1, true) then
-                        local text = "?"
-                        pcall(function() text = textBlock:GetText():ToString() end)
-                        print("  TextBlock: " .. fullName .. " = \"" .. tostring(text) .. "\"")
-                    end
-                end
-            else
-                print("TextWidget: not found")
-            end
-        else
-            print("ModActor: not found")
-        end
-
-        print("")
-        PrintSounds("SoundCue")
-        PrintSounds("SoundWave")
-        PrintSounds("MetaSoundSource")
-        print("==========================================")
+        SyncLobbySettings()
     end)
 end)
 
 print("==========================================")
-print("BlackoutMod LOADED")
+print("BlackoutMod v" .. ModVersion .. " LOADED")
 print("==========================================")
-print("v2.5.0 - Bugfix Update (Crash Prevention)")
 print("Current Lobby Code: " .. LobbyCode)
 print("")
 print("Press O to Sabotage (Dissident only, when near defibrillator)")
-if MaxSabotagesPerRound > 0 then
-    print("Limited to " .. MaxSabotagesPerRound .. "x per round")
-else
-    print("Unlimited sabotage enabled")
-end
 if AllowManualRepair or DebugForceDissident then
     print("Press P for Manual Repair (emergency)")
 end
-if MaxBlackoutDuration > 0 then
-    print("Blackouts end automatically after " .. MaxBlackoutDuration .. "s")
-end
-if SabotageCooldown > 0 then
-    print("Cooldown between blackouts: " .. SabotageCooldown .. "s")
-end
 print("Press L for Lobby Code Info")
 print("Press I for Debug Info (check role & sync status)")
-if DebugForceDissident then
-    print("Press K for Diagnose (widget & sounds)")
-end
+print("Press F5 to reload config.txt")
+print("(Lobby settings follow once loaded from the server)")
 print("==========================================")
 if DebugForceDissident then
     print("")
@@ -1230,3 +1258,6 @@ if LobbyCode == "0000" then
     print("Run install.bat to set your own code!")
     print("")
 end
+
+-- Last, so everything it uses is defined
+SyncLobbySettings()

@@ -1,311 +1,132 @@
-# BlackoutMod - Installation Package
+# BlackoutMod v3.0.0 for LOCKDOWN Protocol
 
-## Quick Installation (Recommended)
+The Dissident can sabotage a defibrillator and cut the power: the lights flicker,
+a power-down sound plays and the whole facility goes dark for every player in
+your group.
 
-1. **Extract this entire folder** to your Desktop or Downloads
-2. **Double-click `install.hta`**
-3. If Windows shows a security warning:
-   - Click "Run"
-4. Follow the on-screen instructions
-5. The installer will:
-   - Automatically install UE4SS (included in this package)
-   - Find your LOCKDOWN Protocol installation
-   - Copy all files to the correct locations
-   - Ask for your lobby code (simple 4-8 digit code)
-   - Configure everything automatically
+## Features
 
-**Can't find your game folder?**
-Open Steam → Right-click LOCKDOWN Protocol → Manage → Browse local files
+- **Sabotage** as Dissident at any defibrillator (press **O**)
+- **Lights flicker and a sound plays** before the power goes out
+- **Lobby settings by the host**: one player creates the lobby and chooses the
+  rules, everyone else just enters the code
+- **Limits**: sabotages per round, cooldown between blackouts, maximum blackout duration
+- Lights come back when someone dies, batteries are inserted, players return to
+  the lobby, or the maximum duration is reached
 
-## Windows SmartScreen Warning
+## Installation
 
-When you run `install.hta`, Windows may show a security warning. This is normal for unsigned scripts.
+1. **Close the game** and extract this whole package (e.g. to your Desktop).
+2. Double-click **`install.bat`**. If Windows SmartScreen warns you, click
+   *More info* > *Run anyway*. The script is not signed.
+3. The installer finds your game through Steam automatically. If it can't, enter the
+   game folder (Steam: right-click the game > *Manage* > *Browse local files*).
+4. Choose your role:
+   - **Create a new lobby** (one person per group, the "host"):
+     press Enter for a random code, then choose the settings. Share the code with your friends.
+   - **Join a lobby** (everyone else): enter the code from your host.
+     The installer shows the host's settings.
+5. Start the game. The UE4SS console should show `BlackoutMod v3.0.0 LOADED`.
 
-This happens because the files aren't digitally signed (which costs $300-500/year). The mod is safe.
+UE4SS (the mod loader) is included and installed automatically.
 
-## Alternative: Manual Launcher
+### Updating from v2.5
 
-If you don't trust the automatic installers:
-1. Rename `install.bat.txt` to `install.bat`
-2. Run `install.bat`
-3. Follow the prompts
+Run `install.bat` again and choose **Keep these settings**. Your old config is
+converted automatically.
 
-## Package Contents
+If your group uses a **short code (4-5 characters)**, it keeps working, but short
+codes are easy to guess and can't have host settings. The host should
+**create a new lobby** and send everyone the new code.
+
+## In-game keys
+
+| Key | Action |
+|-----|--------|
+| **O** | Sabotage (Dissident only, near a defibrillator) |
+| **L** | Show lobby code and settings |
+| **I** | Debug info (role, lobby code, sync status) |
+| **F5** | Reload `config.txt` without restarting the game |
+
+## Settings
+
+The installer writes `config.txt` here:
 
 ```
-BlackoutMod/
-├── install.hta              <- Run this!
-├── install.bat.txt          <- Manual option (rename to .bat)
-├── README.md                <- You are here
-├── Dependencies/
-│   └── UE4SS/               <- UE4SS Experimental (included!)
-│       ├── dwmapi.dll
-│       └── ue4ss/
-│           └── Mods/
-│               └── BPModLoaderMod/  <- Also included!
-├── Mods/
-│   └── BlackoutMod/
-│       ├── Scripts/
-│       │   └── main.lua     (Lua mod)
-│       ├── enabled.txt
-│       └── config.txt       (Created by installer)
-└── LogicMods/
-    ├── BlackoutMod.pak      (Blueprint HUD)
-    ├── BlackoutMod.ucas
-    └── BlackoutMod.utoc
+LOCKDOWN Protocol\LockdownProtocol\Binaries\Win64\ue4ss\Mods\BlackoutMod\config.txt
 ```
 
-## How Lobby Codes Work
-
-**No complex setup required!** This mod uses a shared server (hosted by me) with simple lobby codes.
-
-### For Hosts:
-1. Run installer
-2. Choose a unique lobby code (e.g., `1234`, `5678`, `mygroup`)
-3. Share the code with your friends
-4. Play!
-
-### For Players:
-1. Run installer
-2. Enter the SAME code your host gave you
-3. Play!
-
-**That's it!** Everyone with the same code will be synchronized.
-
-### Lobby Code Tips:
-- Use unique codes like `8472`, `test`, `mygroup`
-- 4-8 characters: Letters and numbers OK
-- Case-sensitive: `Test` ≠ `test`
-
-### Changing Your Lobby Code:
-
-Location: LOCKDOWN Protocol\...\ue4ss\Mods\BlackoutMod\config.txt
-Change the code, save, restart game
-
-**Note:** Always restart the game after changing your lobby code!
-
-## Manual Installation (If installer doesn't work)
-
-### Step 1: Install UE4SS
-
-Copy everything from `Dependencies\UE4SS\` to:
 ```
-LOCKDOWN Protocol\LockdownProtocol\Binaries\Win64\
+LobbyCode=k4m9x2ab
+
+# Lobby host only:
+OwnerKey=...
+MaxSabotagesPerRound=1
+Cooldown=0
+MaxBlackoutDuration=0
 ```
 
-You should have:
-- `...\Win64\dwmapi.dll`
-- `...\Win64\ue4ss\` (folder)
+| Setting | Meaning |
+|---------|---------|
+| `LobbyCode` | Same code for everyone in the group (4-8 letters/digits, `-` and `_`) |
+| `OwnerKey` | Only in the host's config. Allows changing the lobby settings. **Keep it secret.** |
+| `MaxSabotagesPerRound` | Sabotages per Dissident per round, `0` = unlimited |
+| `Cooldown` | Seconds after the lights come back before the next sabotage, `0` = off |
+| `MaxBlackoutDuration` | Seconds until the lights come back by themselves, `0` = off |
 
-### Step 2: Copy Lua Mod
+**Shared settings:** the last three settings come from the **host**. When the game
+starts (or on F5), the host's mod uploads them and everyone else's mod downloads
+them. In a player's config they are only used if the lobby has no host settings
+(older lobbies).
 
-Copy the `Mods\BlackoutMod` folder to:
-```
-LOCKDOWN Protocol\LockdownProtocol\Binaries\Win64\ue4ss\Mods\
-```
+To **change the lobby settings**, the host edits their `config.txt` and presses
+**F5** (or runs the installer again and keeps the settings). The other players get
+the new settings on their next game start or when they press F5.
 
-Final path should be:
-```
-...\Win64\ue4ss\Mods\BlackoutMod\Scripts\main.lua
-```
+## Uninstall
 
-**Can't find your game folder?**
-Open Steam → Right-click LOCKDOWN Protocol → Manage → Browse local files
-
-### Step 3: Copy Blueprint Mod
-
-Copy the 3 files from `LogicMods\` to:
-```
-LOCKDOWN Protocol\LockdownProtocol\Content\Paks\LogicMods\
-```
-
-(Create the `LogicMods` folder if it doesn't exist)
-
-### Step 4: Create config.txt
-
-Create a file named `config.txt` in:
-```
-...\Win64\ue4ss\Mods\BlackoutMod\config.txt
-```
-
-Content of config.txt (just the code, nothing else):
-```
-1234
-```
-
-Replace `1234` with your chosen lobby code.
-
-## How to Use In-Game
-
-**Keybinds:**
-- **O** - Sabotage (Dissident only, when near defibrillator)
-- **P** - Manual Repair (emergency)
-- **L** - Show how to change lobby code
-- **I** - Debug Info (check code & sync status)
-
-**How it works:**
-1. Join a game as DISSIDENT
-2. Walk to a defibrillator
-3. Press **O** to sabotage
-4. All lights turn off for everyone (with same lobby code)
-5. Lights come back on when:
-   - Someone dies
-   - Batteries are inserted
-   - Players return to lobby
-
-## Playing With Friends
-
-### Setup (One Time):
-
-**Host:**
-1. Choose a unique lobby code (e.g., `5678`)
-2. Run installer, enter `5678`
-3. Tell friends: "Lobby code is 5678"
-
-**Friends:**
-1. Run installer
-2. Enter `5678` (the same code!)
-3. Done!
-
-### Every Game Session:
-
-Everyone just starts the game - no setup needed!
-
-**To verify everyone is synced:**
-- Press **I** in-game
-- Check "Lobby Code" matches
-- Should all show the same code
+Run `install.bat` and choose **2 = Uninstall**. It removes BlackoutMod and asks
+whether to remove UE4SS as well. Only remove UE4SS if no other mods use it.
 
 ## Troubleshooting
 
-**Installer can't find the game:**
-- Enter the path manually when prompted
-- Example: `D:\Steam\steamapps\common\LOCKDOWN Protocol`
+**Blackout doesn't sync between players**
+- Press **I** in-game on every PC: the lobby code must be exactly the same (case-sensitive).
+- Everyone needs an internet connection. `curl` (included in Windows 10/11) is used to talk to the server.
 
-**"Access Denied" error:**
-- The installer needs write permissions
-- Try running as Administrator
-- Or use manual installation
+**"OwnerKey doesn't match this lobby" in the console**
+- The `OwnerKey` in your config belongs to a different lobby. Create a new lobby with the installer.
 
-**Mod doesn't load in-game:**
-- Check UE4SS console (opens with the game)
-- Should say "BlackoutMod LOADED"
-- Should show "Loaded Lobby Code: XXXX"
-- If not, verify file paths above
+**No sound**
+- The sound is played through Windows (PowerShell), so the in-game volume doesn't
+  affect it. Check the Windows volume mixer.
 
-**Widget doesn't appear:**
-- Make sure you're playing as Dissident
-- Stand near a defibrillator
-- Check that BPModLoaderMod is loaded (press I in-game)
+**Game freezes**
+- Clicking into the UE4SS console window starts a text selection, which pauses all
+  console output and freezes the game. BlackoutMod turns this off (QuickEdit) for the
+  console while the game runs. If it still happens, click the console and press **Esc**.
 
-**Lights don't turn off:**
-- Press **I** to check lobby code
-- Make sure curl is working (usually pre-installed on Windows 10/11)
-- Check UE4SS console for error messages
+**Mod doesn't load**
+- The UE4SS console opens with the game and should show `BlackoutMod v3.0.0 LOADED`.
+- Run `install.bat` again. If you get "Access denied", run it as administrator.
 
-**Blackout not syncing between players:**
-- **Most common issue**: Different lobby codes!
-  - Everyone press **I** in-game
-  - Compare lobby codes
-  - Must be EXACTLY the same (case-sensitive!)
-- Make sure everyone restarted game after setting code
-- Codes like `0000` are public - everyone using it will sync
+**Sabotage doesn't work**
+- You must be the Dissident and stand close to a defibrillator.
+- Check the limits with **L**: sabotages per round used up, or the cooldown is still running.
 
-**"Server Response: null":**
-- This is normal on first sabotage
-- The server creates data on first write
-- If it persists after sabotage, check your internet connection
+## Server and privacy
 
-**Sabotage doesn't work at all:**
-- Check you're Dissident (press I)
-- Stand close to defibrillator
-- If you already sabotaged this round, you can't do it again (by default)
-
-## Configuration Options
-
-Edit `main.lua` to customize:
-
-**Unlimited sabotage:**
-```lua
-local EnableOneTimePerRound = false  -- Change true to false
-```
-
-**Interaction range:**
-```lua
-local InteractionDistance = 300.0  -- Increase for longer range
-```
-
-**Server sync speed:**
-```lua
-local PollInterval = 500  -- Lower = faster sync (more requests)
-                         -- 500ms = 2 checks per second (recommended)
-                         -- 200ms = 5 checks per second (faster but more traffic)
-```
-
-**Note:** Restart game after changing settings.
-
-## Privacy & Server
-
-**Your data:**
-- Only your lobby code and blackout state are stored
-- No personal information is collected
-
-**Server:**
-- Hosted by me using Firebase
-- Free for everyone
-- Handles 100+ concurrent players easily
-
-## Uninstalling
-
-**Remove BlackoutMod only:**
-Delete these folders/files:
-```
-...\Win64\ue4ss\Mods\BlackoutMod
-...\Content\Paks\LogicMods\BlackoutMod.*
-```
-
-**Remove everything (including UE4SS):**
-Delete:
-```
-...\Win64\dwmapi.dll
-...\Win64\ue4ss\
-...\Content\Paks\LogicMods\BlackoutMod.*
-```
-
-## Technical Details
-
-**How it works:**
-- Shared Firebase Realtime Database (hosted by mod creator)
-- Each lobby code gets its own isolated data path
-- 500ms polling interval (2 checks per second)
-- Automatic sync when lights are toggled
-- No authentication required
-
-**Performance:**
-- Minimal impact on game FPS
-- Lights toggle in batches (smooth transitions)
-- Low bandwidth usage (~1-2 KB per check)
-- Scales well with many players
+The blackout state and lobby settings are synchronized through a shared Firebase
+database run by the mod author. Stored per lobby code: the blackout state with a
+timestamp, the lobby settings, and the host key. No personal data is stored. The list
+of lobby codes can't be read, and only the host can change lobby settings.
+Anyone who knows a lobby code can still trigger a blackout in that lobby, so use
+long codes.
 
 ## Credits
 
-**Includes:**
-- UE4SS (MIT License) - https://github.com/UE4SS-RE/RE-UE4SS
+- **Created by:** Novvyy
+- UE4SS (MIT License): https://github.com/UE4SS-RE/RE-UE4SS
 - BPModLoaderMod (included with UE4SS)
-- Firebase Realtime Database (for sync)
 
-**Created by:** Novvyy
-
-## Support
-
-For help, visit the Nexus Mods page:
-- POSTS tab for questions
-- BUGS tab for issues
-- Check if others have the same problem
-
-**Common issues are usually:**
-1. Lobby codes don't match (press I to check)
-2. Game not restarted after changing code
-3. UE4SS not installed correctly
-
-Enjoy sabotaging!
+Questions and bug reports: Nexus Mods page (POSTS / BUGS tab).

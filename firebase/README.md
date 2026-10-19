@@ -3,32 +3,41 @@
 `database.rules.json` sind die Security Rules für die Realtime Database
 `blackoutmod-shared-default-rtdb`.
 
-## Was sie bewirken
+## Datenmodell pro Lobby (`/lobbies/<code>`)
 
-- Niemand kann mehr `/.json` oder `/lobbies.json` lesen, also keine Liste aller Lobby-Codes.
-- Lesen und Schreiben geht nur noch auf `/lobbies/<code>/blackout`, genau das, was die Mod nutzt.
-- Der Code muss 4–8 Zeichen lang sein (Buchstaben, Ziffern, `_`, `-`), wie in der Mod.
-- Es dürfen nur `isBlackout` (Boolean) und `timestamp` (Zahl) gespeichert werden. Fremde Daten
-  oder das Löschen anderer Lobbys sind nicht mehr möglich.
+| Pfad | Lesen | Schreiben |
+|------|-------|-----------|
+| `blackout` (`isBlackout`, `timestamp`) | jeder mit Code | jeder mit Code (4–8 Zeichen) |
+| `owner` (Host-Schlüssel) | niemand | nur einmal (beim Erstellen), nur Codes mit 6–8 Zeichen |
+| `settings/key` | niemand | – |
+| `settings/values` (`maxSabotages`, `cooldown`, `maxDuration`, `flicker`) | jeder mit Code | nur zusammen mit `key` == `owner` |
 
-Kompatibel mit v2.5: Die alte Mod nutzt dieselben Pfade und Felder.
+- `/.json` und `/lobbies.json` sind nicht lesbar, es gibt also keine Liste aller Codes.
+- Der Installer erstellt eine Lobby mit einem PATCH auf `/lobbies/<code>.json` mit
+  `owner` und `settings`. Ist `owner` schon vergeben, schlägt das fehl (401), der
+  Code ist dann belegt.
+- Die Mod des Hosts schreibt `settings` beim Start bzw. bei F5 mit ihrem `OwnerKey`.
+  Alle anderen lesen nur `settings/values`.
+- Abwärtskompatibel mit v2.5: `blackout` ist unverändert.
 
-Ohne Login bleibt eine Grenze: Wer einen Code kennt oder errät, kann in dieser Lobby den Blackout
-an- und ausschalten. Dagegen helfen nur längere Codes (6–8 Zeichen).
+Ohne Login bleibt eine Grenze: Wer einen Code kennt oder errät, kann in dieser Lobby
+den Blackout an- und ausschalten. Dagegen helfen nur lange Codes.
 
 ## Einspielen
 
-1. https://console.firebase.google.com → Projekt `blackoutmod-shared` öffnen
-2. **Realtime Database → Regeln (Rules)**
-3. Die aktuellen Regeln als Backup kopieren, dann den Inhalt von `database.rules.json` einfügen
-4. **Veröffentlichen**
-
-## Prüfen
+Aus dem Repo-Root, mit eingeloggter Firebase CLI:
 
 ```powershell
-# Muss jetzt "Permission denied" liefern:
-Invoke-RestMethod "https://blackoutmod-shared-default-rtdb.firebaseio.com/lobbies.json?shallow=true"
+npx firebase-tools deploy --only database --project blackoutmod-shared
+```
 
-# Muss weiter funktionieren:
-Invoke-RestMethod "https://blackoutmod-shared-default-rtdb.firebaseio.com/lobbies/test1234/blackout.json"
+`firebase.json` verweist auf `firebase/database.rules.json`. Die Regeln vor v3
+liegen als Backup in `database.rules.backup-2026-10-19.json`.
+
+## Test-Lobbys löschen
+
+Lobbys mit `owner` lassen sich per REST nicht löschen, nur mit Admin-Rechten:
+
+```powershell
+npx firebase-tools database:remove /lobbies/<code> --project blackoutmod-shared
 ```

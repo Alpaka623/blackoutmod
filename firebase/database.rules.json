@@ -17,6 +17,36 @@
           "$other": {
             ".validate": false
           }
+        },
+        "owner": {
+          ".write": "!data.exists() && $code.length >= 6 && $code.length <= 8 && $code.matches(/^[A-Za-z0-9_-]+$/)",
+          ".validate": "newData.isString() && newData.val().length >= 16 && newData.val().length <= 64"
+        },
+        "settings": {
+          ".write": "newData.parent().child('owner').exists() && newData.child('key').val() === newData.parent().child('owner').val()",
+          ".validate": "newData.hasChildren(['key', 'values'])",
+          "key": {
+            ".validate": "newData.isString()"
+          },
+          "values": {
+            ".read": true,
+            ".validate": "newData.hasChildren(['maxSabotages', 'cooldown', 'maxDuration'])",
+            "maxSabotages": {
+              ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 99"
+            },
+            "cooldown": {
+              ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 3600"
+            },
+            "maxDuration": {
+              ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 3600"
+            },
+            "$other": {
+              ".validate": false
+            }
+          },
+          "$other": {
+            ".validate": false
+          }
         }
       }
     }
