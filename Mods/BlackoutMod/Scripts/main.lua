@@ -6,12 +6,20 @@ local LobbyCode = "0000"  -- Default, loaded from config.txt
 -- CONFIGURATION
 -- ============================================
 local MaxSabotagesPerRound = 1  -- 0 = unlimited, any other number = max sabotages per round per dissident
+local DebugForceDissident = false  -- TESTING ONLY: always treat local player as Dissident (keep false for release!)
+local MaxBlackoutDuration = 0  -- Seconds until lights come back automatically (0 = off, e.g. 180)
+local AllowManualRepair = false  -- P key repair (always allowed while DebugForceDissident is on)
 -- ============================================
 -- CONFIGURATION END
 -- ============================================
 
+local UEHelpers = require("UEHelpers")
+
 local InteractionDistance = 300.0
 local PollInterval = 1000  -- 1 second polling
+
+-- Runs a callback off the game thread (for blocking curl calls)
+local RunAsync = ExecuteAsync or function(callback) ExecuteWithDelay(0, callback) end
 
 -- Performance optimizations
 -- Role caching (reduces FindAllOf calls)
@@ -22,7 +30,16 @@ local RoleCacheTimeout = 2000     -- Cache for 2 seconds
 local CurrentServerState = false
 local SabotageCount = 0
 local LastSabotageTime = -100
-local PlayersAliveAtStart = 0 
+local PlayersAliveAtStart = 0
+local LivingPawnsAtStart = {}  -- FullName -> true, pawns alive when the blackout started
+
+-- Local state changes win over the server for a few seconds, so an
+-- async PUT that hasn't landed yet doesn't get reverted by the next poll
+local LastLocalChangeTime = -100
+local LocalChangeGrace = 5.0
+
+-- Graphics values from before the blackout (restored afterwards)
+local SavedGraphics = nil
 
 -- HUD Variables
 local IsNearCharger = false
@@ -76,6 +93,10 @@ LoadConfig()
 -- ============================================
 
 function IsPlayerDissident()
+    if DebugForceDissident then
+        return true
+    end
+
     -- Return cached result if still valid
     local currentTime = os.clock() * 1000
     if CachedRole ~= nil and (currentTime - LastRoleCheck < RoleCacheTimeout) then
@@ -179,6 +200,25 @@ function SendHttpRequest(action, waitForResponse)
     end
     
     return nil
+end
+
+-- Sends sabotage/repair without blocking the calling (game) thread
+function SendHttpRequestAsync(action)
+    RunAsync(function()
+        local success, err = pcall(function()
+            SendHttpRequest(action, false)
+        end)
+        if not success then
+            print("BlackoutMod: ERROR sending " .. action .. " request: " .. tostring(err))
+        end
+    end)
+end
+
+function ParseJsonNumber(jsonString, key)
+    if not jsonString then return nil end
+
+    local value = jsonString:match('"' .. key .. '"%s*:%s*(%-?%d+%.?%d*)')
+    return tonumber(value)
 end
 
 function ParseJsonBool(jsonString, key)
@@ -378,6 +418,40 @@ function CountLivingPlayers()
     return livingCount
 end
 
+function GetPawnHealth(pawn)
+    local health = nil
+    pcall(function() health = pawn:GetPropertyValue("Health") end)
+    if type(health) == "number" then return health end
+    return nil
+end
+
+-- Clients only own their local PlayerController, so CountLivingPlayers can't see
+-- other players there. PlayerStates are replicated to everyone, so remember which
+-- pawns were alive (by name, no UObject refs kept) and watch for their health hitting 0.
+-- Pawns that disappear are ignored: they may just be out of network relevancy range.
+function SnapshotLivingPawns()
+    LivingPawnsAtStart = {}
+    for _, pawn in ipairs(UEHelpers.GetAllPlayers()) do
+        local health = GetPawnHealth(pawn)
+        if health and health > 0 then
+            LivingPawnsAtStart[pawn:GetFullName()] = true
+        end
+    end
+end
+
+function FindDeadKnownPawn()
+    for _, pawn in ipairs(UEHelpers.GetAllPlayers()) do
+        local name = pawn:GetFullName()
+        if LivingPawnsAtStart[name] then
+            local health = GetPawnHealth(pawn)
+            if health and health <= 0 then
+                return name
+            end
+        end
+    end
+    return nil
+end
+
 -- ============================================
 -- BLACKOUT FUNCTIONS
 -- ============================================
@@ -407,24 +481,30 @@ function SetBlackout(active)
     if active then
         local countSuccess, countErr = pcall(function()
             PlayersAliveAtStart = CountLivingPlayers()
+            SnapshotLivingPawns()
         end)
         if countSuccess then
             print("BlackoutMod: Blackout started. Living Players: " .. PlayersAliveAtStart)
         else
             print("BlackoutMod: Blackout started. (Player count failed: " .. tostring(countErr) .. ")")
             PlayersAliveAtStart = 0
+            LivingPawnsAtStart = {}
         end
     end
 
     local cmdSuccess, cmdErr = pcall(function()
         if active then
+            if not SavedGraphics then
+                SavedGraphics = ReadGraphicsSettings()
+            end
             RunCommand("r.ExposureOffset -15")
             RunCommand("r.Lumen.DiffuseIndirect.Allow 0")
             RunCommand("gamma 0.5")
-        else
-            RunCommand("r.ExposureOffset 0")
-            RunCommand("r.Lumen.DiffuseIndirect.Allow 1")
-            RunCommand("gamma 2.2")
+        elseif SavedGraphics then
+            RunCommand(string.format("r.ExposureOffset %g", SavedGraphics.ExposureOffset))
+            RunCommand(string.format("r.Lumen.DiffuseIndirect.Allow %d", SavedGraphics.LumenDiffuse))
+            RunCommand(string.format("gamma %g", SavedGraphics.Gamma))
+            SavedGraphics = nil
         end
     end)
     if not cmdSuccess then
@@ -432,10 +512,40 @@ function SetBlackout(active)
     end
 end
 
+-- Reads the player's current values so the blackout doesn't overwrite their settings.
+-- Falls back to the previous hardcoded defaults if a value can't be read.
+function ReadGraphicsSettings()
+    local settings = {ExposureOffset = 0, LumenDiffuse = 1, Gamma = 2.2}
+
+    pcall(function()
+        local Kismet = UEHelpers.GetKismetSystemLibrary()
+        if Kismet and Kismet:IsValid() then
+            local exposure = Kismet:GetConsoleVariableFloatValue("r.ExposureOffset")
+            if type(exposure) == "number" then settings.ExposureOffset = exposure end
+            local lumen = Kismet:GetConsoleVariableIntValue("r.Lumen.DiffuseIndirect.Allow")
+            if type(lumen) == "number" then settings.LumenDiffuse = math.floor(lumen) end
+        end
+    end)
+
+    pcall(function()
+        local Engine = UEHelpers.GetEngine()
+        if Engine and Engine:IsValid() then
+            local gamma = Engine.DisplayGamma
+            if type(gamma) == "number" and gamma > 0 then settings.Gamma = gamma end
+        end
+    end)
+
+    print(string.format("BlackoutMod: Saved graphics (Exposure %g, Lumen %d, Gamma %g)",
+        settings.ExposureOffset, settings.LumenDiffuse, settings.Gamma))
+    return settings
+end
+
+-- Must run on the game thread; the HTTP request itself runs async
 function ForceRepair(reason)
     print("BlackoutMod: REPAIR! Reason: " .. reason)
-    SendHttpRequest("repair", false)
-    CurrentServerState = false 
+    SendHttpRequestAsync("repair")
+    LastLocalChangeTime = os.clock()
+    CurrentServerState = false
     SetBlackout(false)
 end
 
@@ -444,7 +554,13 @@ function CheckWinConditions()
 
     -- Grace period: don't check win conditions during the first 8 seconds after blackout
     -- With multiple clients, player counts can fluctuate briefly due to replication delays
-    if (os.clock() - LastSabotageTime) < 8.0 then return end
+    local elapsed = os.clock() - LastSabotageTime
+    if elapsed < 8.0 then return end
+
+    if MaxBlackoutDuration > 0 and elapsed >= MaxBlackoutDuration then
+        ForceRepair("Time limit reached (" .. MaxBlackoutDuration .. "s)")
+        return
+    end
 
     local playerLoc = GetPlayerLocation()
     if playerLoc and playerLoc.Z >= 500 then
@@ -455,6 +571,13 @@ function CheckWinConditions()
     local currentLiving = CountLivingPlayers()
     if currentLiving < PlayersAliveAtStart then
         ForceRepair("Player died (Prev: " .. PlayersAliveAtStart .. ", Now: " .. currentLiving .. ")")
+        return
+    end
+
+    local deadPawn = nil
+    pcall(function() deadPawn = FindDeadKnownPawn() end)
+    if deadPawn then
+        ForceRepair("Player died (" .. deadPawn .. ")")
         return
     end
 
@@ -507,43 +630,61 @@ end)
 -- MAIN LOOPS
 -- ============================================
 
+-- Applies the polled server state. Must run on the game thread.
+function ApplyServerState(serverBlackout, serverTimestamp)
+    if serverBlackout == nil then return end
+
+    -- Our own sabotage/repair may not have reached the server yet
+    if (os.clock() - LastLocalChangeTime) < LocalChangeGrace then return end
+
+    -- Leftover blackout, e.g. someone crashed or quit during one
+    -- (+10s tolerance because the timestamp comes from another PC's clock)
+    if serverBlackout and MaxBlackoutDuration > 0 and serverTimestamp
+        and (os.time() - serverTimestamp) > MaxBlackoutDuration + 10 then
+        ForceRepair("Blackout on server expired")
+        return
+    end
+
+    if serverBlackout ~= CurrentServerState then
+        CurrentServerState = serverBlackout
+
+        if serverBlackout then
+            print("BlackoutMod: SYNC -> Blackout ACTIVATED (lights OFF)")
+            -- Set LastSabotageTime on ALL clients (not just saboteur) so the
+            -- win-condition grace period works for everyone
+            LastSabotageTime = os.clock()
+        else
+            print("BlackoutMod: SYNC -> Blackout DEACTIVATED (lights ON)")
+        end
+
+        SetBlackout(CurrentServerState)
+    end
+end
+
 -- Server Sync Loop (1 second)
+-- The HTTP request stays on this async thread, everything touching UObjects runs on the game thread
 LoopAsync(PollInterval, function()
     local response = SendHttpRequest("status", true)
     local serverBlackout = ParseJsonBool(response, "isBlackout")
+    local serverTimestamp = ParseJsonNumber(response, "timestamp")
 
-    if serverBlackout ~= nil then
-        if (serverBlackout == false) and (os.clock() - LastSabotageTime < 5.0) then
-            serverBlackout = true
+    ExecuteInGameThread(function()
+        local syncSuccess, syncErr = pcall(function()
+            ApplyServerState(serverBlackout, serverTimestamp)
+            CheckWinConditions()
+            CheckLobbyReset()
+        end)
+        if not syncSuccess then
+            print("BlackoutMod: ERROR in sync loop: " .. tostring(syncErr))
         end
+    end)
 
-        if serverBlackout ~= CurrentServerState then
-            CurrentServerState = serverBlackout
-
-            if serverBlackout then
-                print("BlackoutMod: SYNC -> Blackout ACTIVATED (lights OFF)")
-                -- Set LastSabotageTime on ALL clients (not just saboteur) so the
-                -- win-condition grace period works for everyone
-                LastSabotageTime = os.clock()
-            else
-                print("BlackoutMod: SYNC -> Blackout DEACTIVATED (lights ON)")
-            end
-
-            SetBlackout(CurrentServerState)
-        end
-    end
-
-    CheckWinConditions()
-    CheckLobbyReset()
     return false
 end)
 
 -- HUD Update Loop (200ms instead of 50ms for better performance)
 LoopAsync(200, function()
-    -- Charger scan happens OUTSIDE ExecuteInGameThread to reduce risk
-    -- Only scan every 2 seconds (ChargerScanInterval), uses cached plain Lua tables
-    pcall(ScanChargerLocations)
-
+    -- Charger scan (every 2s, ChargerScanInterval) happens inside CheckChargerProximity on the game thread
     ExecuteInGameThread(function()
         local hudSuccess, hudErr = pcall(function()
             local nearCharger = CheckChargerProximity()
@@ -577,14 +718,21 @@ end)
 -- KEY BINDINGS
 -- ============================================
 
--- P = Manual Repair
+-- P = Manual Repair (disabled unless AllowManualRepair or DebugForceDissident)
 RegisterKeyBind(Key.P, function()
-    print("BlackoutMod: Manual Repair")
-    ForceRepair("Manual P")
+    if not (AllowManualRepair or DebugForceDissident) then
+        print("BlackoutMod: Manual repair is disabled (AllowManualRepair = false)")
+        return
+    end
+
+    ExecuteInGameThread(function()
+        print("BlackoutMod: Manual Repair")
+        ForceRepair("Manual P")
+    end)
 end)
 
 -- O = Sabotage
-RegisterKeyBind(Key.O, function()
+function TrySabotage()
     if not IsPlayerDissident() then
         print("BlackoutMod: Only Dissident can sabotage!")
         return
@@ -613,13 +761,9 @@ RegisterKeyBind(Key.O, function()
     end
 
     LastSabotageTime = os.clock()
+    LastLocalChangeTime = os.clock()
 
-    local success, err = pcall(function()
-        SendHttpRequest("sabotage", false)
-    end)
-    if not success then
-        print("BlackoutMod: ERROR sending sabotage request: " .. tostring(err))
-    end
+    SendHttpRequestAsync("sabotage")
     CurrentServerState = true
 
     local blSuccess, blErr = pcall(function()
@@ -628,6 +772,10 @@ RegisterKeyBind(Key.O, function()
     if not blSuccess then
         print("BlackoutMod: FATAL ERROR in SetBlackout: " .. tostring(blErr))
     end
+end
+
+RegisterKeyBind(Key.O, function()
+    ExecuteInGameThread(TrySabotage)
 end)
 
 -- L = Lobby Code Info
@@ -651,47 +799,53 @@ end)
 
 -- I = Debug Info
 RegisterKeyBind(Key.I, function()
-    print("==========================================")
-    print("BlackoutMod: DEBUG INFO")
-    print("==========================================")
-    print("Lobby Code: " .. LobbyCode)
-    print("Player Role: " .. (IsPlayerDissident() and "DISSIDENT" or "EMPLOYEE"))
-    print("ServerUrl: " .. ServerUrl .. "/" .. LobbyCode)
-    print("CurrentServerState: " .. tostring(CurrentServerState))
-    if MaxSabotagesPerRound > 0 then
-        print("Sabotage Count: " .. SabotageCount .. "/" .. MaxSabotagesPerRound)
-    else
-        print("Sabotage Count: " .. SabotageCount .. " (unlimited)")
-    end
-    
-    local playerLoc = GetPlayerLocation()
-    if playerLoc then
-        print("Player Z Position: " .. tostring(playerLoc.Z))
-        if playerLoc.Z >= 500 then
-            print("  -> In LOBBY")
+    ExecuteInGameThread(function()
+        print("==========================================")
+        print("BlackoutMod: DEBUG INFO")
+        print("==========================================")
+        print("Lobby Code: " .. LobbyCode)
+        print("Player Role: " .. (IsPlayerDissident() and "DISSIDENT" or "EMPLOYEE"))
+        print("ServerUrl: " .. ServerUrl .. "/" .. LobbyCode)
+        print("CurrentServerState: " .. tostring(CurrentServerState))
+        if MaxSabotagesPerRound > 0 then
+            print("Sabotage Count: " .. SabotageCount .. "/" .. MaxSabotagesPerRound)
         else
-            print("  -> In GAME")
+            print("Sabotage Count: " .. SabotageCount .. " (unlimited)")
         end
-    end
-    
-    print("")
-    print("Checking server right now...")
-    local response = SendHttpRequest("status", true)
-    local serverBlackout = ParseJsonBool(response, "isBlackout")
-    
-    print("Server Response: " .. tostring(response))
-    print("Server isBlackout: " .. tostring(serverBlackout))
-    
-    if serverBlackout ~= CurrentServerState then
+
+        local playerLoc = GetPlayerLocation()
+        if playerLoc then
+            print("Player Z Position: " .. tostring(playerLoc.Z))
+            if playerLoc.Z >= 500 then
+                print("  -> In LOBBY")
+            else
+                print("  -> In GAME")
+            end
+        end
+
         print("")
-        print("WARNING: Out of sync!")
-        print("Local state: " .. tostring(CurrentServerState))
-        print("Server state: " .. tostring(serverBlackout))
-    else
-        print("")
-        print("Status: IN SYNC")
-    end
-    print("==========================================")
+        print("Checking server right now...")
+
+        -- Server check runs async so the game doesn't freeze while curl waits
+        RunAsync(function()
+            local response = SendHttpRequest("status", true)
+            local serverBlackout = ParseJsonBool(response, "isBlackout")
+
+            print("Server Response: " .. tostring(response))
+            print("Server isBlackout: " .. tostring(serverBlackout))
+
+            if serverBlackout ~= CurrentServerState then
+                print("")
+                print("WARNING: Out of sync!")
+                print("Local state: " .. tostring(CurrentServerState))
+                print("Server state: " .. tostring(serverBlackout))
+            else
+                print("")
+                print("Status: IN SYNC")
+            end
+            print("==========================================")
+        end)
+    end)
 end)
 
 print("==========================================")
@@ -706,10 +860,20 @@ if MaxSabotagesPerRound > 0 then
 else
     print("Unlimited sabotage enabled")
 end
-print("Press P for Manual Repair (emergency)")
+if AllowManualRepair or DebugForceDissident then
+    print("Press P for Manual Repair (emergency)")
+end
+if MaxBlackoutDuration > 0 then
+    print("Blackouts end automatically after " .. MaxBlackoutDuration .. "s")
+end
 print("Press L for Lobby Code Info")
 print("Press I for Debug Info (check role & sync status)")
 print("==========================================")
+if DebugForceDissident then
+    print("")
+    print(" DEBUG: DebugForceDissident is ON - you are always Dissident!")
+    print("")
+end
 if LobbyCode == "0000" then
     print("")
     print(" WARNING: Using default lobby code!")
