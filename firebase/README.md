@@ -10,7 +10,7 @@
 | `blackout` (`isBlackout`, `timestamp`) | jeder mit Code | jeder mit Code (4–8 Zeichen) |
 | `owner` (Host-Schlüssel) | niemand | nur einmal (beim Erstellen), nur Codes mit 6–8 Zeichen |
 | `settings/key` | niemand | – |
-| `settings/values` (`maxSabotages`, `cooldown`, `maxDuration`, `flicker`) | jeder mit Code | nur zusammen mit `key` == `owner` |
+| `settings/values` (`maxSabotages`, `cooldown`, `maxDuration`) | jeder mit Code | nur zusammen mit `key` == `owner` |
 
 - `/.json` und `/lobbies.json` sind nicht lesbar, es gibt also keine Liste aller Codes.
 - Der Installer erstellt eine Lobby mit einem PATCH auf `/lobbies/<code>.json` mit
