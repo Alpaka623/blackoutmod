@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Server sync runs in one background helper that keeps its connection open,
+  instead of starting curl every second. This cuts the data used per request
+  (no new TLS handshake every second). If the helper can't run, the mod uses curl as before.
+
 ## v3.0.0
 
 ### New

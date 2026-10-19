@@ -269,8 +269,13 @@ function SendHttpRequest(action, waitForResponse)
     return nil
 end
 
--- Sends sabotage/repair without blocking the calling (game) thread
+-- Sends sabotage/repair without blocking the calling (game) thread:
+-- through the helper's open connection when it works, otherwise with curl
 function SendHttpRequestAsync(action)
+    if ReadHelperState() and HelperSend(string.format("put %s %d", action == "sabotage" and "true" or "false", os.time())) then
+        return
+    end
+
     RunAsync(function()
         local success, err = pcall(function()
             SendHttpRequest(action, false)
@@ -472,71 +477,91 @@ function HidePromptWidget()
 end
 
 -- ============================================
--- SOUND
+-- HELPER PROCESS (Scripts/blackout_helper.ps1)
 -- ============================================
+-- One PowerShell process runs for the whole game session and
+-- - polls the blackout state over a kept-alive HTTPS connection and writes it to
+--   HelperStateFile. Starting curl every second cost a TLS handshake per request
+--   (~5 KB), most of the Firebase download quota.
+-- - sends sabotage/repair writes over the same connection
+-- - plays the WAV (game sound assets stay silent when played through UE4SS)
+-- - turns off QuickEdit for the shared UE4SS console (a click froze the game)
+-- Commands go to its stdin, it exits when the game closes (stdin closes).
+-- If it doesn't work (e.g. blocked by antivirus), polling and writes fall back to curl.
+local HelperScript = "ue4ss/Mods/BlackoutMod/Scripts/blackout_helper.ps1"
+local HelperStateFile = "ue4ss/Mods/BlackoutMod/state.txt"
+local HelperStateMaxAge = 5  -- seconds; an older state means the helper isn't working
+local HelperPipe = nil
+local HelperErrorLogged = false
 
--- Game sound assets can be played (IsPlaying = true) but stay silent in this game,
--- so the mod plays its own WAV through Windows (not affected by the in-game volume).
--- A PowerShell player is started once and preloads the file; each line written to
--- its stdin plays it. Starting PowerShell per sound took too long (sound came after
--- the flicker). The player exits by itself when the game closes (stdin closes).
--- It also turns off QuickEdit for the shared UE4SS console, see sound_player.ps1.
-local SoundPlayerScript = "ue4ss/Mods/BlackoutMod/Scripts/sound_player.ps1"
-local SoundPlayers = {}  -- path -> pipe to the player's stdin
-local SoundErrorLogged = false
+function ToWindowsPath(path)
+    return (path:gsub("/", "\\"))
+end
 
-function StartSoundPlayer(path)
-    for _, required in ipairs({path, SoundPlayerScript}) do
+function StartHelper()
+    for _, required in ipairs({HelperScript, FlickerSoundFile}) do
         local file = io.open(required, "rb")
         if not file then
             print("BlackoutMod: File not found: " .. required)
-            return nil
+            return
         end
         file:close()
     end
 
-    -- No -WindowStyle Hidden: the player shares the UE4SS console and would hide it
-    local cmd = string.format('powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%s" "%s"',
-        (SoundPlayerScript:gsub("/", "\\")), (path:gsub("/", "\\")))
-    return io.popen(cmd, "w")
+    -- No -WindowStyle Hidden: the helper shares the UE4SS console and would hide it
+    local cmd = string.format('powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%s" "%s" "%s" "%s"',
+        ToWindowsPath(HelperScript), ToWindowsPath(FlickerSoundFile), ServerUrl, ToWindowsPath(HelperStateFile))
+    local success, pipe = pcall(io.popen, cmd, "w")
+    if success then HelperPipe = pipe end
 end
 
-function PlayWavFile(path)
-    if not path or path == "" then return end
+-- Returns true if the line was handed to the helper
+function HelperSend(line)
+    if not HelperPipe then return false end
 
     local success, err = pcall(function()
-        if SoundPlayers[path] == nil then
-            SoundPlayers[path] = StartSoundPlayer(path) or false
-        end
-        local pipe = SoundPlayers[path]
-        if not pipe then return end
-
-        local ok, writeErr = pcall(function()
-            pipe:write("play\n")
-            pipe:flush()
-        end)
-        if not ok then
-            -- Player died: start a new one next time
-            SoundPlayers[path] = nil
-            error(writeErr)
-        end
+        HelperPipe:write(line .. "\n")
+        HelperPipe:flush()
     end)
-
-    if not success and not SoundErrorLogged then
-        print("BlackoutMod: ERROR playing sound: " .. tostring(err))
-        SoundErrorLogged = true
+    if not success then
+        HelperPipe = nil
+        if not HelperErrorLogged then
+            print("BlackoutMod: Helper stopped (" .. tostring(err) .. "), using curl")
+            HelperErrorLogged = true
+        end
     end
+    return success
 end
 
--- Start the player at load time so the first blackout has no PowerShell startup delay
-function PreloadSound(path)
-    if not path or path == "" then return end
-    pcall(function()
-        SoundPlayers[path] = StartSoundPlayer(path) or false
-    end)
+-- Latest blackout state from the helper: {isBlackout, timestamp}, or nil if the
+-- helper isn't working or the state belongs to another lobby
+function ReadHelperState()
+    local file = io.open(HelperStateFile, "r")
+    if not file then return nil end
+    local line = file:read("*l")
+    file:close()
+    if not line then return nil end
+
+    local lobby, isBlackout, timestamp, writtenAt = line:match("^1;([^;]*);([^;]*);([^;]*);(%d+);end")
+    if lobby ~= LobbyCode then return nil end
+    if os.time() - tonumber(writtenAt) > HelperStateMaxAge then return nil end
+
+    local state = {timestamp = tonumber(timestamp)}
+    if isBlackout == "true" then
+        state.isBlackout = true
+    elseif isBlackout == "false" then
+        state.isBlackout = false
+    end
+    return state
 end
 
-PreloadSound(FlickerSoundFile)
+function PlayBlackoutSound()
+    HelperSend("play")
+end
+
+-- Started at load time so the first blackout has no PowerShell startup delay
+StartHelper()
+HelperSend("lobby " .. LobbyCode)
 
 -- ============================================
 -- PROXIMITY & PLAYER FUNCTIONS
@@ -848,7 +873,7 @@ local FlickerId = 0  -- Increments per blackout so steps of an older flicker get
 -- Must run on the game thread. Flickers the lights, then calls SetBlackout(true),
 -- unless the blackout was repaired in the meantime.
 function StartBlackout()
-    PlayWavFile(FlickerSoundFile)
+    PlayBlackoutSound()
 
     FlickerId = FlickerId + 1
     local myId = FlickerId
@@ -1027,11 +1052,18 @@ function ApplyServerState(serverBlackout, serverTimestamp)
 end
 
 -- Server Sync Loop (1 second)
--- The HTTP request stays on this async thread, everything touching UObjects runs on the game thread
+-- Reads the helper's state file; only when the helper isn't working, curl asks the
+-- server directly (on this async thread). Everything touching UObjects runs on the game thread.
 LoopAsync(PollInterval, function()
-    local response = SendHttpRequest("status", true)
-    local serverBlackout = ParseJsonBool(response, "isBlackout")
-    local serverTimestamp = ParseJsonNumber(response, "timestamp")
+    local serverBlackout, serverTimestamp
+    local state = ReadHelperState()
+    if state then
+        serverBlackout, serverTimestamp = state.isBlackout, state.timestamp
+    else
+        local response = SendHttpRequest("status", true)
+        serverBlackout = ParseJsonBool(response, "isBlackout")
+        serverTimestamp = ParseJsonNumber(response, "timestamp")
+    end
 
     ExecuteInGameThread(function()
         local syncSuccess, syncErr = pcall(function()
@@ -1191,6 +1223,7 @@ RegisterKeyBind(Key.I, function()
             end
         end
 
+        print("Helper: " .. (ReadHelperState() and "running (kept-alive connection)" or "not running, using curl"))
         print("")
         print("Checking server right now...")
 
@@ -1222,6 +1255,7 @@ RegisterKeyBind(Key.F5, function()
         print("BlackoutMod: Reloading config...")
         local oldCode = LobbyCode
         LoadConfig()
+        HelperSend("lobby " .. LobbyCode)
 
         -- Leaving a lobby during its blackout: lights back on locally only
         if LobbyCode ~= oldCode and CurrentServerState then
